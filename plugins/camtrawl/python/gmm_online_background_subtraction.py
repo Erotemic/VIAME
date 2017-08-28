@@ -420,6 +420,8 @@ class FishStereo(object):
 
             world_pts = stereo.triangulate(pts1, pts2)
 
+            cv2.convertPointsToHomogeneous
+
             proj_pt_h = P1.dot(np.vstack([world_pts, [1] * len(world_pts.T)]))
             proj_pt = proj_pt_h[0:2] / proj_pt_h[2]
             print('pts1 =\n{!r}'.format(pts1))
