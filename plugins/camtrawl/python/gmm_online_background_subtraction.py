@@ -392,6 +392,11 @@ class FishStereo(object):
 
     def find_match(self, detections1, detections2, cal, dsize):
         """
+
+        References:
+            http://docs.opencv.org/2.4/modules/calib3d/doc/camera_calibration_and_3d_reconstruction.html
+            http://answers.opencv.org/question/117141/triangulate-3d-points-from-a-stereo-camera-and-chessboard/
+            https://gist.github.com/royshil/7087bc2560c581d443bc#file-simpleadhoctracker-cpp-L93
         """
         for det1, det2 in it.product(detections1, detections2):
             print('----')
