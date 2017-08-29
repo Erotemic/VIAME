@@ -433,8 +433,24 @@ class FishStereo(object):
                 xys = np.divide(xyzs[:, :-1], xyzs.T[-1][:, None])
                 return xys
 
+            unpts1 = cv2.undistortPoints(pts1[:, None, :], K1, kc1)[:, 0, :]
+            unpts2 = cv2.undistortPoints(pts2[:, None, :], K2, kc2)[:, 0, :]
+
             rectified = cv2.stereoRectify(K1, kc1, K2, kc2, dsize, R, T)
             (R1, R2, P1, P2, Q, validPixROI1, validPixROI2) = rectified
+            print('validPixROI1 = {!r}'.format(validPixROI1))
+            print('validPixROI2 = {!r}'.format(validPixROI2))
+
+            # In [176]: print(ut.repr2(P2, precision=3))
+            # np.array([[  1.018e+03,   0.000e+00,   6.354e+02,   0.000e+00],
+            #           [  0.000e+00,   1.018e+03,   7.804e+02,   2.131e+05],
+            #           [  0.000e+00,   0.000e+00,   1.000e+00,   0.000e+00]])
+
+            # In [177]: print(ut.repr2(P1, precision=3))
+            # np.array([[  1.018e+03,   0.000e+00,   6.354e+02,   0.000e+00],
+            #           [  0.000e+00,   1.018e+03,   7.804e+02,   0.000e+00],
+            #           [  0.000e+00,   0.000e+00,   1.000e+00,   0.000e+00]])
+
             world_pts_homog = cv2.triangulatePoints(P1, P2, pts1.T, pts2.T).T
             world_pts = from_homog(world_pts_homog)
 
