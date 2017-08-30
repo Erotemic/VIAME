@@ -27,7 +27,8 @@ import itertools as it
 import numpy as np
 import scipy.optimize
 from imutils import (
-    imscale, ensure_grayscale, overlay_heatmask, from_homog, to_homog)
+    imscale, ensure_grayscale, overlay_heatmask, from_homog, to_homog,
+    downsample_average_blocks)
 from os.path import expanduser, basename, join
 
 OrientedBBox = namedtuple('OrientedBBox', ('center', 'extent', 'angle'))
@@ -45,11 +46,12 @@ class FishDetector(object):
 
     """
     def __init__(self, **kwargs):
-        bg_algo = kwargs.get('bg_algo', 'custom')
+        bg_algo = kwargs.get('bg_algo', 'median')
 
         self.config = {
             # limits accepable targets to be within this region [padx, pady]
-            'edge_limit': [12, 12],
+            'edge_trim': [12, 12],
+
             # Maximum aspect ratio for filtering out non-fish objects
             'max_aspect': 7.5,
             # Minimum aspect ratio for filtering out non-fish objects
@@ -61,7 +63,7 @@ class FishDetector(object):
         }
 
         # Different default params depending on the background subtraction algo
-        if self.config['bg_algo'] == 'custom':
+        if self.config['bg_algo'] == 'median':
             self.config.update({
                 'factor': 4.0,
                 'min_size': 50,
@@ -78,8 +80,8 @@ class FishDetector(object):
         self.config.update(kwargs)
 
         # Choose which algo to use for background subtraction
-        if self.config['bg_algo'] == 'custom':
-            self.background_model = CustomBackgroundSubtractor(
+        if self.config['bg_algo'] == 'median':
+            self.background_model = MedianBackgroundSubtractor(
                 diff_thresh=self.config['diff_thresh'],
             )
         elif self.config['bg_algo'] == 'gmm':
@@ -94,7 +96,7 @@ class FishDetector(object):
         # )
 
     def postprocess_mask(self, mask):
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         # opening is erosion followed by dilation
         mask = cv2.erode(src=mask, kernel=kernel, dst=mask)
         mask = cv2.dilate(src=mask, kernel=kernel, dst=mask)
@@ -116,6 +118,29 @@ class FishDetector(object):
             detection['hull'] = upfactor * detection['hull']
             detection['box_points'] = upfactor * detection['box_points']
 
+    def preprocess_image(self, img):
+        """
+        Preprocess image before subtracting backround
+        """
+        # Convert to grayscale
+        img_ = ensure_grayscale(img)
+        # Downsample image before running detection
+        factor = self.config['factor']
+        if factor != 1.0:
+            if self.config['bg_algo'] == 'median':
+                # Special downsampling for median background subtraction algo
+                factor = int(factor)
+                img_ = downsample_average_blocks(img_, factor)
+                upfactor = np.array([factor] * 2)
+            else:
+                downfactor_ = 1 / factor
+                img_, downfactor = imscale(img, downfactor_)
+                upfactor = 1 / np.array(downfactor)
+        else:
+            upfactor = np.array([1., 1.])
+            img_ = img
+        return img_, upfactor
+
     def apply(self, img):
         """
         Example:
@@ -125,22 +150,16 @@ class FishDetector(object):
             >>> self, img = demodata(target_step='detect', target_frame_num=7)
             >>> detections, masks = self.apply(img)
             >>> print('detections = {!r}'.format(detections))
-            >>> self.draw_detections(img, detections, masks)
-        """
-        # Convert to grayscale
-        img_ = ensure_grayscale(img)
-        # Downsample image before running detection
+            >>> draw_img = DrawHelper.draw_detections(img, detections, masks)
+            >>> import plottool as pt
+            >>> pt.qtensure()
+            >>> pt.imshow(draw_img)
 
-        if self.config['bg_algo'] == 'gmm':
-            if self.config['factor'] != 1.0:
-                downfactor_ = 1 / self.config['factor']
-                img_, downfactor = imscale(img, downfactor_)
-                upfactor = 1 / np.array(downfactor)
-            else:
-                img_ = img_
-        else:
-            # custom takes care of downsample
-            upfactor = np.array([self.config['factor']] * 2)
+        Ignore:
+            detections['box_points']
+        """
+        # Downsample and convert to grayscale
+        img_, upfactor = self.preprocess_image(img)
 
         # Run detection / update background model
         orig_mask = self.background_model.apply(img_)
@@ -174,7 +193,7 @@ class FishDetector(object):
         n_ccs, cc_mask = cv2.connectedComponents(mask, connectivity=4)
 
         # Define thresholds to filter edges
-        minx_lim, miny_lim = self.config['edge_limit']
+        minx_lim, miny_lim = self.config['edge_trim']
         maxx_lim = img_w - minx_lim
         maxy_lim = img_h - miny_lim
 
@@ -219,84 +238,116 @@ class FishDetector(object):
             }
             yield detection
 
-
-class CustomBackgroundSubtractor(object):
-    """
-    custom algorithm for subtracting background
-    """
-
-    def __init__(self, diff_thresh=19):
-        self.diff_thresh = diff_thresh
-        self.bgimg = None
-
-    def apply(self, img):
+    def local_thresh2(self, img_, detection, post_mask):
         """
+        Function to perform local threshold background subtraction on all
+        individual fish, with boxed coordinates set by coords.
 
-        Debug:
-            import sys
-            sys.path.append('/home/joncrall/code/VIAME/plugins/camtrawl/python')
-            from gmm_online_background_subtraction import *
+        Each object, specified is locally background subtracted using a
+        threshold equal to the mean + 1*sigma of the gaussian fit to the
+        histogram of the grayscale values in tempim.
 
-            image_path_list1, _, _ = demodata_input(dataset=2)
+        Also, included in here is a routine to keep bordering objects to each
+        fish if it is on the diagonal, which i4mat_components does not do.  imN
+        replaces all the objects in im with the new 0/1 local objects.  imN
+        should be a more correct estimate of the actual object sizes.
 
-            import plottool as pt
-            pt.qtensure()
-            self = CustomBackgroundSubtractor()
-            for i in [0, 3, 6, 9]:
-                img1 = cv2.imread(image_path_list1[0 + i])
-                img2 = cv2.imread(image_path_list1[1 + i])
-                img3 = cv2.imread(image_path_list1[2 + i])
-                mask1, bg1 = self.apply(img1), self.bgimg.copy()
-                mask2, bg2 = self.apply(img2), self.bgimg.copy()
-                mask3, bg3 = self.apply(img3), self.bgimg.copy()
+        Ignore:
+            pt.imshow(DrawHelper.draw_detections(img_.astype(np.uint8), [detection], {}))
 
-                pt.imshow(img1, fnum=i, pnum=(3, 3, 1))
-                pt.imshow(img2, fnum=i, pnum=(3, 3, 2))
-                pt.imshow(img3, fnum=i, pnum=(3, 3, 3))
-                pt.imshow(mask1, fnum=i, pnum=(3, 3, 4))
-                pt.imshow(mask2, fnum=i, pnum=(3, 3, 5))
-                pt.imshow(mask3, fnum=i, pnum=(3, 3, 6))
-                pt.imshow(bg1, fnum=i, pnum=(3, 3, 7))
-                pt.imshow(bg2, fnum=i, pnum=(3, 3, 8))
-                pt.imshow(bg3, fnum=i, pnum=(3, 3, 9))
+        Doctest:
+            >>> import sys
+            >>> sys.path.append('/home/joncrall/code/VIAME/plugins/camtrawl/python')
+            >>> from gmm_online_background_subtraction import *
+            >>> self, img = demodata(target_step='detect', target_frame_num=7)
+            >>> img_ = self.preprocess_image(img)[0]
+            >>> post_mask = self.background_model.apply(img_)
+            >>> detection = list(self.masked_detect(post_mask))[0]
+
         """
-        img_ = ensure_grayscale(img)
+        refined = post_mask.copy()
 
-        def downsample_average_blocks(img, factor):
-            """
-            Funky way of downsampling. Averages blocks of pixels.
-            Equivalent to a strided 2D convolution with a uniform matrix
-            Unfortunately scipy doesn't seem to have a strided implementation
-            """
-            dsize = tuple(np.divide(img_.shape, factor).astype(np.int)[0:2])
-            temp_img = np.zeros(dsize)
-            for r, c in it.product(range(factor), range(factor)):
-                temp_img += img_[r::factor, c::factor]
-            new_img = temp_img / (factor ** 2)
-            return new_img
+        center_c, center_r = map(int, map(round, detection['oriented_bbox'].center))
+        # Extract a padded region around the detection
+        radius = int(round(max(detection['oriented_bbox'].extent)))
+        r1 = max(center_r - radius, 0)
+        c1 = max(center_c - radius, 0)
+        r2 = min(center_r + radius, img_.shape[0])
+        c2 = min(center_c + radius, img_.shape[1])
+        chip = img_[r1:r2, c1:c2]
 
-        factor = 4
-        new_img = downsample_average_blocks(img, factor)
+        import scipy.stats
+        mu, sigma = scipy.stats.norm.fit(chip.ravel())
+        level = mu + sigma
 
+        sub_mask = np.zeros(chip.shape, dtype=np.uint8)
+        sub_mask[chip > level] = 255
+        sub_ccs, sub_labels = cv2.connectedComponents(sub_mask, connectivity=4)
+
+        refined[r1:r2, c1:c2][sub_labels > 0] = 255
+
+        # Remove objects with a total number of pixels below the set minn at
+        # the beginning, while keeping those that are bordering (includes diagonals)
+        # the 'fish', which is the largest.
+        # cc = detection['cc']
+        pass
+
+
+class MedianBackgroundSubtractor(object):
+    """
+    algorithm for subtracting background net in fish stereo images
+    """
+
+    def __init__(bgmodel, diff_thresh=19):
+        bgmodel.diff_thresh = diff_thresh
+        bgmodel.bgimg = None
+
+    def apply(bgmodel, img):
+        """
+        Debugging:
+            >>> import sys
+            >>> sys.path.append('/home/joncrall/code/VIAME/plugins/camtrawl/python')
+            >>> from gmm_online_background_subtraction import *
+            >>> #
+            >>> # plottool is my custom plotting library
+            >>> import plottool as pt
+            >>> pt.qtensure()
+            >>> #
+            >>> image_path_list1, _, _ = demodata_input(dataset=2)
+            >>> stream = FrameStream(image_path_list1, stride=1)
+            >>> detector = FishDetector(bg_algo='median')
+            >>> bgmodel = MedianBackgroundSubtractor()
+            >>> def getimg(i):
+            >>>     return detector.preprocess_image(stream[i][1])[0]
+            >>> step = 1
+            >>> for i in range(7, 7 + step * 9, step):
+            >>>     imgs = [getimg(i + j) for j in range(step)]
+            >>>     masks = []
+            >>>     bgs = []
+            >>>     for img in imgs:
+            >>>         masks.append(bgmodel.apply(img))
+            >>>         bgs.append(bgmodel.bgimg.copy())
+            >>>     for j, (img, mask, bg) in enumerate(zip(imgs, masks, bgs)):
+            >>>         pt.imshow(img,  fnum=i, pnum=(step, 3, 1 + step * j))
+            >>>         pt.imshow(mask, fnum=i, pnum=(step, 3, 2 + step * j))
+            >>>         pt.imshow(bg,   fnum=i, pnum=(step, 3, 3 + step * j))
+        """
         # Subtract the previous background image and make a new one
-        if self.bgimg is None:
-            self.bgimg = new_img
-            mask = np.zeros(img_.shape, dtype=np.uint8)
+        if bgmodel.bgimg is None:
+            bgmodel.bgimg = img
+            mask = np.zeros(img.shape, dtype=np.uint8)
         else:
-            fr_diff = new_img - self.bgimg
-            mask = fr_diff > self.diff_thresh
+            fr_diff = img - bgmodel.bgimg
+            mask = fr_diff > bgmodel.diff_thresh
 
             # This seems to put black pixels always in the background.
-            fg_mask = (fr_diff > self.diff_thresh)
-            fg_img = (fg_mask * new_img)  # this is background substracted image
+            fg_mask = (fr_diff > bgmodel.diff_thresh)
+            fg_img = (fg_mask * img)  # this is background substracted image
             mask = (fg_img > 0).astype(np.uint8) * 255
 
-            # update the background image
-            # (not sure what the intuition is behind this particular update)
-            # My guess: slowly make pixels more likely to be fg, unless they
-            # were background recently?
-            self.bgimg -= 1
-            self.bgimg[fr_diff > 1] += 2
+            # median update the background image
+            bgmodel.bgimg -= 1
+            bgmodel.bgimg[fr_diff > 1] += 2
         return mask
 
 
@@ -405,14 +456,15 @@ class StereoCalibration(object):
 
 
 class FishStereoTriangulationAssignment(object):
-    def __init__(self):
+    def __init__(self, **kwargs):
         self.config = {
             # Threshold for errors between before & after projected
             # points to make matches between left and right
-            # 'max_err': [6, 14],
-            'max_err': [300, 300],
+            'max_err': [6, 14],
+            # 'max_err': [300, 300],
             'small_len': 15,  # in centimeters
         }
+        self.config.update(kwargs)
 
     def triangulate(self, cal, det1, det2):
         """
@@ -611,13 +663,21 @@ class DrawHelper(object):
     def draw_detections(img, detections, masks):
         # Upscale masks to original image size
         dsize = tuple(img.shape[0:2][::-1])
-        orig_mask = cv2.resize(masks['orig'], dsize)
-        post_mask = cv2.resize(masks['post'], dsize)
+        shape = img.shape[0:2]
+        if 'orig' in masks:
+            orig_mask = cv2.resize(masks['orig'], dsize)
+            shape = orig_mask.shape[0:2]
+        if 'post' in masks:
+            post_mask = cv2.resize(masks['post'], dsize)
+            shape = post_mask.shape[0:2]
 
         # Create a heatmap for detections
-        draw_mask = np.zeros(post_mask.shape[0:2], dtype=np.float)
-        draw_mask[orig_mask > 0] = .2
-        draw_mask[post_mask > 0] = .75
+        draw_mask = np.zeros(shape, dtype=np.float)
+
+        if 'orig' in masks:
+            draw_mask[orig_mask > 0] = .2
+        if 'post' in masks:
+            draw_mask[post_mask > 0] = .75
         for n, detection in enumerate(detections, start=1):
             cc = cv2.resize(detection['cc'].astype(np.uint8), dsize)
             draw_mask[cc > 0] = 1.0
@@ -815,26 +875,57 @@ def demo():
 
     dpath = ub.ensuredir('out')
 
-    stride = 2
+    if 0:
+        # Use GMM based model
+        stride = 1
+        gmm_params = {
+            'n_training_frames': 6,
+            'gmm_thresh': 20,
+            'factor': 4,
+            'min_size': 1000,
+            'edge_trim': [10, 10],
+        }
+        gmm_params = {
+            'n_training_frames': 30,
+            'gmm_thresh': 20,
+            'factor': 2,
+            'min_size': 1000,
+            'edge_trim': [12, 12],
+        }
+        triangulate_params = {
+            'max_err': [50, 50],
+        }
+        detector1 = FishDetector(bg_algo='gmm', **gmm_params)
+        detector2 = FishDetector(bg_algo='gmm', **gmm_params)
+    else:
+        # Use ??? based model
+        triangulate_params = {
+            'max_err': [6, 14],
+        }
+        detect_params = {
+            'factor': 4,
+            'min_size': 50,
+            'edge_trim': [10, 10],
+        }
+        stride = 2
+        detector1 = FishDetector(diff_thresh=19, bg_algo='median', **detect_params)
+        detector2 = FishDetector(diff_thresh=15, bg_algo='median', **detect_params)
+
     stream1 = FrameStream(image_path_list1, stride=stride)
     stream2 = FrameStream(image_path_list2, stride=stride)
-
-    detector1 = FishDetector(diff_thresh=19, bg_algo='custom')
-    detector2 = FishDetector(diff_thresh=15, bg_algo='custom')
 
     _iter = enumerate(zip(stream1, stream2))
     for frame_num, ((frame_id1, img1), (frame_id2, img2)) in _iter:
         assert frame_id1 == frame_id2
         frame_id = frame_id1
         print('frame_id = {!r}'.format(frame_id))
-        print('frame_num = {!r}'.format(frame_num))
 
         detections1, masks1 = detector1.apply(img1)
         detections2, masks2 = detector2.apply(img2)
 
         # stacked = vt.stack_images(masks1['draw'], masks2['draw'], vert=False)[0]
         if len(detections1) > 0 or len(detections2) > 0:
-            self = FishStereoTriangulationAssignment()
+            self = FishStereoTriangulationAssignment(**triangulate_params)
             assignment, assign_data = self.find_matches(cal, detections1, detections2)
         else:
             assignment, assign_data = None, None
@@ -843,7 +934,7 @@ def demo():
         stacked = DrawHelper.draw_stereo_detections(img1, detections1, masks1,
                                                     img2, detections2, masks2,
                                                     assignment, assign_data)
-        cv2.imwrite(dpath + '/mask{}_{}_draw.png'.format(frame_id, frame_num),
+        cv2.imwrite(dpath + '/mask{}_draw.png'.format(frame_id),
                     stacked)
         # if frame_num == 7:
         #     break
