@@ -26,12 +26,54 @@ import cv2
 import itertools as it
 import numpy as np
 import scipy.optimize
-from imutils import (
+from imutils import ( # NOQA
     imscale, ensure_grayscale, overlay_heatmask, from_homog, to_homog,
     downsample_average_blocks)
 from os.path import expanduser, basename, join
 
+try:
+    import utool as ut
+    print, rrr, profile = ut.inject2(__name__)
+except ImportError:
+    def profile(func):
+        return func
+
+
 OrientedBBox = namedtuple('OrientedBBox', ('center', 'extent', 'angle'))
+
+
+def grabcut(bgr_img, prior_mask, binary=True, num_iters=5):
+    """
+    Referencs:
+        http://docs.opencv.org/trunk/doc/py_tutorials/py_imgproc/py_grabcut/py_grabcut.html
+    """
+    # Grab Cut Parameters
+    (h, w) = bgr_img.shape[0:2]
+    rect = (0, 0, w, h)
+
+    mode = cv2.GC_INIT_WITH_MASK
+    bgd_model = np.zeros((1, 13 * 5), np.float64)
+    fgd_model = np.zeros((1, 13 * 5), np.float64)
+    # Grab Cut Execution
+    post_mask = prior_mask.copy()
+    if binary:
+        is_pr_bgd = (post_mask == 0)
+        if np.all(is_pr_bgd) or not np.any(is_pr_bgd):
+            return post_mask
+        post_mask[post_mask > 0]  = cv2.GC_FGD
+        post_mask[post_mask == 0] = cv2.GC_PR_BGD
+
+    cv2.grabCut(bgr_img, post_mask, rect, bgd_model, fgd_model, num_iters, mode=mode)
+    if binary:
+        is_forground = (post_mask == cv2.GC_FGD) + (post_mask == cv2.GC_PR_FGD)
+        post_mask = np.where(is_forground, 255, 0).astype('uint8')
+    else:
+        label_colors = [       255,           170,            50,          0]
+        label_values = [cv2.GC_FGD, cv2.GC_PR_FGD, cv2.GC_PR_BGD, cv2.GC_BGD]
+        pos_list = [post_mask == value for value in label_values]
+        for pos, color in zip(pos_list, label_colors):
+            post_mask[pos] = color
+    return post_mask
 
 
 class FishDetector(object):
@@ -46,27 +88,28 @@ class FishDetector(object):
 
     """
     def __init__(self, **kwargs):
-        bg_algo = kwargs.get('bg_algo', 'median')
+        bg_algo = kwargs.get('bg_algo', 'gmm')
 
         self.config = {
             # limits accepable targets to be within this region [padx, pady]
+            # These are wrt the original image size
             'edge_trim': [12, 12],
 
-            # Maximum aspect ratio for filtering out non-fish objects
-            'max_aspect': 7.5,
-            # Minimum aspect ratio for filtering out non-fish objects
-            'min_aspect': 3.5,
+            # Min/Max aspect ratio for filtering out non-fish objects
+            'aspect_thresh': (3.5, 7.5,),
 
-            # minimum number of pixels to keep a section, after sections
             # are found by component function
             'bg_algo': bg_algo,
         }
+
+        self.n_iters = 0
 
         # Different default params depending on the background subtraction algo
         if self.config['bg_algo'] == 'median':
             self.config.update({
                 'factor': 4.0,
-                'min_size': 50,
+                # minimum number of pixels to keep a section, wrt original size
+                'min_size': 800,
                 'diff_thresh': 19,
                 'smooth_ksize': None,
                 'local_threshold': True,
@@ -74,10 +117,10 @@ class FishDetector(object):
         else:
             self.config.update({
                 'factor': 2.0,
-                'min_size': 2000,
+                'min_size': 100,
                 'n_training_frames': 30,
                 'gmm_thresh': 30,
-                'smooth_ksize': (5, 5),
+                'smooth_ksize': (10, 10),  # wrt original image size
                 'local_threshold': False,
             })
 
@@ -99,6 +142,7 @@ class FishDetector(object):
         #     detectShadows=False
         # )
 
+    @profile
     def apply(self, img, return_info=True):
         """
         Detects the objects in the image and update the background model.
@@ -113,6 +157,7 @@ class FishDetector(object):
                 for algorithm visualization.
 
         Doctest:
+            % pylab qt5
             >>> import sys
             >>> sys.path.append('/home/joncrall/code/VIAME/plugins/camtrawl/python')
             >>> from gmm_online_background_subtraction import *
@@ -134,37 +179,61 @@ class FishDetector(object):
         if return_info:
             masks['orig'] = mask.copy()
 
-        if self.config['local_threshold']:
-            # Refine initial detections
-            mask = self.local_threshold_mask(img_, mask)
-            if return_info:
-                masks['local'] = mask.copy()
+        if self.n_iters < 3:
+            # Skip the first few frames while the model is learning
+            detections = []
+        else:
+            if self.config['local_threshold']:
+                # Refine initial detections
+                mask = self.local_threshold_mask(img_, mask)
+                if return_info:
+                    masks['local'] = mask.copy()
 
-        # Remove noise
-        if self.config['smooth_ksize'] is not None:
-            mask = self.postprocess_mask(mask)
-            if return_info:
-                masks['post'] = mask.copy()
+            # Remove noise
+            if self.config['smooth_ksize'] is not None:
+                mask = self.postprocess_mask(mask)
+                if return_info:
+                    masks['post'] = mask.copy()
 
-        # Find detections using CC algorithm
-        detections = list(self.masked_detect(mask))
+            # Find detections using CC algorithm
+            detections = list(self.masked_detect(mask))
 
-        if self.config['factor'] != 1.0:
-            # Upscale back to input img coordinates (to agree with camera calib)
-            self.upscale_detections(detections, upfactor)
+            # Grabcut didn't work that well
+            # if False and self.n_iters > 5:
+            #     # Refine detections with grabcut
+            #     mask = np.zeros(mask.shape, dtype=mask.dtype)
+            #     for detection in detections:
+            #         print('RUNNING GC')
+            #         cc = detection['cc'].astype(np.uint8) * 255
+            #         cc = grabcut(img_, cc)
+            #         mask[cc > 0] = 255
+            #     detections = list(self.masked_detect(mask))
+            #     if return_info:
+            #         masks['cut'] = mask.copy()
 
+            if self.config['factor'] != 1.0:
+                # Upscale back to input img coordinates (to agree with camera calib)
+                self.upscale_detections(detections, upfactor)
+
+        self.n_iters += 1
         return detections, masks
 
+    @profile
     def postprocess_mask(self, mask):
-        ksize = self.config['smooth_ksize']
+        ksize = np.array(self.config['smooth_ksize'])
+        ksize = tuple(np.round(ksize / self.config['factor']).astype(np.int))
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, ksize)
         # opening is erosion followed by dilation
-        mask = cv2.erode(src=mask, kernel=kernel, dst=mask)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, dst=mask)
+        # Do a second dilation
         mask = cv2.dilate(src=mask, kernel=kernel, dst=mask)
-        # do another dilation
-        mask = cv2.dilate(src=mask, kernel=kernel, dst=mask)
+
+        # mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, dst=mask)
+        # mask = cv2.erode(src=mask, kernel=kernel, dst=mask)
+        # mask = cv2.dilate(src=mask, kernel=kernel, dst=mask)
         return mask
 
+    @profile
     def upscale_detections(self, detections, upfactor):
         """
         inplace upscaling of bounding boxes and points
@@ -179,6 +248,7 @@ class FishDetector(object):
             detection['hull'] = upfactor * detection['hull']
             detection['box_points'] = upfactor * detection['box_points']
 
+    @profile
     def preprocess_image(self, img):
         """
         Preprocess image before subtracting backround
@@ -192,7 +262,7 @@ class FishDetector(object):
                 # Special downsampling for median background subtraction algo
                 factor = int(factor)
                 img_ = downsample_average_blocks(img_, factor)
-                upfactor = np.array([factor] * 2)
+                upfactor = np.array([factor, factor])
             else:
                 downfactor_ = 1 / factor
                 img_, downfactor = imscale(img, downfactor_)
@@ -202,6 +272,7 @@ class FishDetector(object):
             img_ = img
         return img_, upfactor
 
+    @profile
     def masked_detect(self, mask, **kwargs):
         """
         Find pixel locs of each cc and determine if its a valid detection
@@ -213,15 +284,32 @@ class FishDetector(object):
         img_h, img_w = mask.shape
 
         # 4-way connected compoment algorithm
-        n_ccs, cc_mask = cv2.connectedComponents(mask, connectivity=4)
+        n_ccs, cc_mask = cv2.connectedComponents(mask, connectivity=8)
+
+        hist, bins = np.histogram(cc_mask[cc_mask > 0].ravel(),
+                                  bins=np.arange(1, n_ccs + 1))
+        # Process only labels with enough points
+        filter_size = kwargs.get('filter_size', True)
+        if filter_size:
+            # speed optimization: quickly determine num pixels for each cc
+            # using a histogram instead of checking in the filter func
+            factor = self.config['factor']
+            min_size = self.config['min_size'] / (factor ** 2)
+            # only consider large enough regions
+            valid_labels = bins[0:-1][hist >= min_size]
+            # no longer need to do it in the child func
+            kwargs['filter_size'] = False
+        else:
+            valid_labels = np.arange(1, n_ccs)
 
         # Filter ccs to generate only "good" detections
-        for cc_label in range(1, n_ccs):
+        for cc_label in valid_labels:
             cc = (cc_mask == cc_label)
             detection = self.filter_detection(cc, **kwargs)
             if detection is not None:
                 yield detection
 
+    @profile
     def filter_detection(self, cc, filter_size=True, filter_border=True,
                          filter_aspect=True):
         """
@@ -238,19 +326,23 @@ class FishDetector(object):
                 returns None.
         """
         # note, `np.where` returns coords in (r, c)
-        cc_y, cc_x = np.where(cc)
 
         if filter_size:
             # Remove small regions
-            n_pixels = len(cc_x)
-            if n_pixels < self.config['min_size']:
+            n_pixels = cc.sum()
+            factor = self.config['factor']
+            min_size = self.config['min_size'] / (factor ** 2)
+            if n_pixels < min_size:
                 return None
+
+        cc_y, cc_x = np.where(cc)
 
         if filter_border:
             # Define thresholds to filter edges
+            factor = self.config['factor']
             minx_lim, miny_lim = self.config['edge_trim']
-            maxx_lim = cc.shape[1] - minx_lim
-            maxy_lim = cc.shape[0] - miny_lim
+            maxx_lim = cc.shape[1] - (minx_lim / factor)
+            maxy_lim = cc.shape[0] - (miny_lim / factor)
 
             # Filter objects detected on the edge of the image region
             minx, maxx = cc_x.min(), cc_x.max()
@@ -267,11 +359,14 @@ class FishDetector(object):
         oriented_bbox = OrientedBBox(*cv2.minAreaRect(hull))
         w, h = oriented_bbox.extent
 
+        if w == 0 or h == 0:
+            return None
+
         # Filter objects without fishy aspect ratios
         if filter_aspect:
             ar = max([(w / h), (h / w)])
-            if any([ar < self.config['min_aspect'],
-                    ar > self.config['max_aspect']]):
+            min_aspect, max_aspect = self.config['aspect_thresh']
+            if any([ar < min_aspect, ar > max_aspect]):
                 return None
 
         detection = {
@@ -283,6 +378,7 @@ class FishDetector(object):
         }
         return detection
 
+    @profile
     def local_threshold_mask(self, img_, post_mask):
         refined_mask = post_mask.copy()
         # refined_mask = np.zeros(post_mask.shape, dtype=np.uint8)
@@ -300,6 +396,7 @@ class FishDetector(object):
                                                        detection)
         return refined_mask
 
+    @profile
     def refine_local_threshold(self, img_, refined_mask, detection):
         """
         Function to perform local threshold background subtraction on all
@@ -327,7 +424,7 @@ class FishDetector(object):
         center_c, center_r = map(int, map(round, detection['oriented_bbox'].center))
         # Extract a padded region around the detection
         # Use 2 * the height of the rectangle as the radius
-        radius = int(round(detection['oriented_bbox'].extent[1] * 2))
+        radius = max(2, int(round(detection['oriented_bbox'].extent[1] * 2)))
         # radius = int(round(max(detection['oriented_bbox'].extent) * 2))
         r1 = max(center_r - radius, 0)
         c1 = max(center_c - radius, 0)
@@ -345,10 +442,12 @@ class FishDetector(object):
         sub_mask = np.zeros(chip.shape, dtype=np.uint8)
         sub_mask[chip > level] = 255
         sub_ccs, sub_labels = cv2.connectedComponents(sub_mask, connectivity=4)
-
         hist, bins = np.histogram(sub_labels[sub_labels > 0].ravel(),
                                   bins=np.arange(1, sub_ccs + 1))
-        largest_label = bins[hist.argmax()]
+        if len(hist) > 0:
+            largest_label = bins[hist.argmax()]
+        else:
+            largest_label = 1
 
         # Choose only one of these CCs
         refined_mask[r1:r2, c1:c2][sub_labels == largest_label] = 255
@@ -364,6 +463,7 @@ class MedianBackgroundSubtractor(object):
         bgmodel.diff_thresh = diff_thresh
         bgmodel.bgimg = None
 
+    @profile
     def apply(bgmodel, img):
         """
         Debugging:
@@ -403,7 +503,7 @@ class MedianBackgroundSubtractor(object):
         """
         # Subtract the previous background image and make a new one
         if bgmodel.bgimg is None:
-            bgmodel.bgimg = img
+            bgmodel.bgimg = img.copy()
             mask = np.zeros(img.shape, dtype=np.uint8)
         else:
             fr_diff = img - bgmodel.bgimg
@@ -535,6 +635,7 @@ class FishStereoTriangulationAssignment(object):
         }
         self.config.update(kwargs)
 
+    @profile
     def triangulate(self, cal, det1, det2):
         """
         Assuming, det1 matches det2, we determine 3d-coordinates of each
@@ -544,8 +645,18 @@ class FishStereoTriangulationAssignment(object):
             http://answers.opencv.org/question/117141
             https://gist.github.com/royshil/7087bc2560c581d443bc
             https://stackoverflow.com/a/29820184/887074
+
+        Doctest:
+            >>> # Rows are detections in img1, cols are detections in img2
+            >>> import sys
+            >>> sys.path.append('/home/joncrall/code/VIAME/plugins/camtrawl/python')
+            >>> from gmm_online_background_subtraction import *
+            >>> detections1, detections2, cal = demodata(target_step='triangulate', target_frame_num=6)
+            >>> det1, det2 = detections1[0], detections2[0]
+            >>> self = FishStereoTriangulationAssignment()
+            >>> assignment, assign_data, cand_errors = self.triangulate(cal, det1, det2)
         """
-        _debug = False
+        _debug = 0
         if _debug:
             # Use 4 corners and center to ensure matrix math is good
             # (hard to debug when ndims == npts, so make npts >> ndims)
@@ -580,6 +691,9 @@ class FishStereoTriangulationAssignment(object):
         unpts1_cv = cv2.undistortPoints(pts1_cv, K1, kc1)
         unpts2_cv = cv2.undistortPoints(pts2_cv, K2, kc2)
 
+        # unpts1_cv = self.normalizePixel(pts1.T, **cal.data['left']['intrinsic'])
+        # unpts2_cv = self.normalizePixel(pts2.T, **cal.data['right']['intrinsic'])
+
         # note: trinagulatePoints docs say that it wants a 3x4 projection
         # matrix (ie K.dot(RT)), but we only need to use the RT extrinsic
         # matrix because the undistorted points already account for the K
@@ -612,6 +726,48 @@ class FishStereoTriangulationAssignment(object):
         pts1_3d = RT1.dot(to_homog(world_pts)).T
         pts2_3d = RT2.dot(to_homog(world_pts)).T
         return pts1_3d, pts2_3d, errors, fishlen
+
+    def normalizePixel(self, pts, fc, cc, kc, alpha_c):
+        """
+        Alternative to cv2.undistortPoints. The main difference is that this
+        runs iterative distortion componsation for 20 iters instead of 5.
+
+        Ultimately, it doesn't make much difference, use opencv instead because
+        its faster.
+        """
+        x_distort = np.array([(pts[0, :] - cc[0]) / fc[0], (pts[1, :] - cc[1]) / fc[1]])
+        x_distort[0, :] = x_distort[0, :] - alpha_c * x_distort[1, :]
+        if not np.linalg.norm(kc) == 0:
+            xn = self.compDistortion(x_distort, kc)
+        else:
+            xn = x_distort
+        return xn
+
+    def compDistortion(self, xd, k):
+        if len(k) == 1:  # original comp_distortion_oulu
+            r_2 = xd[:, 0]**2 + xd[:, 1]**2
+            radial_d = 1 + np.dot(np.ones((2, 1)), np.array([(k * r_2)]))
+            radius_2_comp = r_2 / radial_d[0, :]
+            radial_d = 1 + np.dot(np.ones((2, 1)), np.array([(k * radius_2_comp)]))
+            # x = x_dist / radial_d
+
+        else:  # original comp_distortion_oulu
+            k1 = k[0]
+            k2 = k[1]
+            k3 = k[4]
+            p1 = k[2]
+            p2 = k[3]
+
+            x = xd
+
+            for kk in range(20):
+                d = x**2
+                r_2 = d.sum(axis=0)
+                k_radial = 1 + k1 * r_2 + k2 * r_2**2 + k3 * r_2**3
+                delta_x = np.array([2 * p1 * x[0, :] * x[1, :] + p2 * (r_2 + 2 * x[0, :]**2),
+                                    p1 * (r_2 + 2 * x[0, :]**2) + 2 * p2 * x[0, :] * x[1, :]])
+                x = (xd - delta_x) / (np.dot(np.ones((2, 1)), np.array([k_radial])))
+            return x
 
     def minimum_weight_assignment(self, cost_errors):
         """
@@ -652,6 +808,7 @@ class FishStereoTriangulationAssignment(object):
                       if cost_matrix[i, j] < large_val]
         return assignment
 
+    @profile
     def find_matches(self, cal, detections1, detections2):
         """
         Match detections from the left camera to detections in the right camera
@@ -666,8 +823,6 @@ class FishStereoTriangulationAssignment(object):
             >>> assignment, assign_data, cand_errors = self.find_matches(cal, detections1, detections2)
         """
         n_detect1, n_detect2 = len(detections1), len(detections2)
-        print('n_detect1 = {!r}'.format(n_detect1))
-        print('n_detect2 = {!r}'.format(n_detect2))
         cand_world_pts = {}
         cand_fishlen = {}
         cand_rang = {}
@@ -737,6 +892,7 @@ class DrawHelper(object):
     """
 
     @staticmethod
+    @profile
     def draw_detections(img, detections, masks):
         # Upscale masks to original image size
         dsize = tuple(img.shape[0:2][::-1])
@@ -777,6 +933,7 @@ class DrawHelper(object):
         return draw_img
 
     @staticmethod
+    @profile
     def draw_stereo_detections(img1, detections1, masks1,
                                img2, detections2, masks2,
                                assignment=None, assign_data=None,
@@ -991,7 +1148,7 @@ def demo():
 
     dpath = ub.ensuredir('out')
 
-    # bg_algo = 'median'
+    bg_algo = 'median'
     bg_algo = 'gmm'
 
     if bg_algo == 'gmm':
@@ -999,23 +1156,15 @@ def demo():
         stride = 2
         gmm_params = {
             'bg_algo': bg_algo,
-            'n_training_frames': 6,
-            'gmm_thresh': 20,
+            'n_training_frames': 9999,
+            # 'gmm_thresh': 20,
+            'gmm_thresh': 30,
             'factor': 4,
-            'min_size': 1000,
-            'edge_trim': [12, 12],
-            'smooth_ksize': (5, 5),
-            'local_threshold': False,
-        }
-        gmm_params = {
-            'bg_algo': bg_algo,
-            'n_training_frames': 200,
-            'gmm_thresh': 40,
-            'factor': 2,
-            'min_size': 200,
-            'edge_trim': [2, 2],
+            'min_size': 800,
+            'edge_trim': [10, 10],
             # 'smooth_ksize': None,
-            'smooth_ksize': (3, 3),
+            # 'smooth_ksize': (3, 3),
+            'smooth_ksize': (10, 10),  # wrt original image size
             'local_threshold': False,
         }
         triangulate_params = {
@@ -1028,15 +1177,14 @@ def demo():
         detect_params = {
             'bg_algo': bg_algo,
             'factor': 4,
-            'min_size': 50,
-            # 'edge_trim': [10, 10],
-            'edge_trim': [2, 2],
-            # 'smooth_ksize': (5, 5),
-            'smooth_ksize': None,
+            'min_size': 1500,
+            'edge_trim': [10, 10],
+            'smooth_ksize': (10, 10),
             'local_threshold': True,
         }
         triangulate_params = {
-            'max_err': [6, 14],
+            # 'max_err': [6, 14],
+            'max_err': [200, 200],
         }
         stride = 2
         detector1 = FishDetector(diff_thresh=19, **detect_params)
@@ -1055,12 +1203,21 @@ def demo():
     stream2 = FrameStream(image_path_list2, stride=stride)
 
     n_total = 0
+    all_errors = []
+    all_lengths = []
 
-    _iter = enumerate(zip(stream1, stream2))
+    import ubelt as ub
+    prog = ub.ProgIter(enumerate(zip(stream1, stream2)),
+                       clearline=True,
+                       length=len(stream1) // stride,
+                       adjust=False)
+    _iter = prog
+    # _iter = enumerate(zip(stream1, stream2))
     for frame_num, ((frame_id1, img1), (frame_id2, img2)) in _iter:
         assert frame_id1 == frame_id2
         frame_id = frame_id1
-        print('frame_id = {!r}'.format(frame_id))
+        # prog.ensure_newline()
+        # print('frame_id = {!r}'.format(frame_id))
 
         detections1, masks1 = detector1.apply(img1)
         detections2, masks2 = detector2.apply(img2)
@@ -1069,21 +1226,37 @@ def demo():
         if len(detections1) > 0 or len(detections2) > 0:
             assignment, assign_data, cand_errors = triangulator.find_matches(
                 cal, detections1, detections2)
+            all_errors += [d['error'] for d in assign_data]
+            all_lengths += [d['fishlen'] for d in assign_data]
             n_total += len(assignment)
-            print('n_total = {!r}'.format(n_total))
+            # if len(assignment):
+            #     prog.ensure_newline()
+            #     print('n_total = {!r}'.format(n_total))
         else:
             cand_errors = None
             assignment, assign_data = None, None
 
         # if assignment:
-        stacked = DrawHelper.draw_stereo_detections(img1, detections1, masks1,
-                                                    img2, detections2, masks2,
-                                                    assignment, assign_data,
-                                                    cand_errors)
-        cv2.imwrite(dpath + '/mask{}_draw.png'.format(frame_id), stacked)
+        DRAWING = 0
+        if DRAWING:
+            stacked = DrawHelper.draw_stereo_detections(img1, detections1, masks1,
+                                                        img2, detections2, masks2,
+                                                        assignment, assign_data,
+                                                        cand_errors)
+            cv2.imwrite(dpath + '/mask{}_draw.png'.format(frame_id), stacked)
         # if frame_num == 7:
         #     break
+        # if frame_num > 10:
+        #     break
+
+    all_errors = np.array(all_errors)
+    all_lengths = np.array(all_lengths)
     print('n_total = {!r}'.format(n_total))
+    print('ave_error = {:.2f} +- {:.2f}'.format(all_errors.mean(), all_errors.std()))
+    print('ave_lengths = {:.2f} +- {:.2f} '.format(all_lengths.mean(), all_lengths.std()))
+
 
 if __name__ == '__main__':
     demo()
+    import utool as ut
+    ut.dump_profile_text()

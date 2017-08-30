@@ -4,6 +4,13 @@ import itertools as it
 import numpy as np
 import cv2
 
+try:
+    import utool as ut
+    print, rrr, profile = ut.inject2(__name__)
+except ImportError:
+    def profile(func):
+        return func
+
 
 def downsample_average_blocks(img, factor):
     """
@@ -42,7 +49,8 @@ def imscale(img, scale):
     new_scale = new_w / w, new_h / h
     new_dsize = (new_w, new_h)
 
-    new_img = cv2.resize(img, new_dsize, interpolation=cv2.INTER_LANCZOS4)
+    # new_img = cv2.resize(img, new_dsize, interpolation=cv2.INTER_LANCZOS4)
+    new_img = cv2.resize(img, new_dsize, interpolation=cv2.INTER_LINEAR)
     return new_img, new_scale
 
 
@@ -88,6 +96,7 @@ def from_homog(homog_pts):
     return pts
 
 
+@profile
 def ensure_grayscale(img):
     """
     Checks if an image is grayscale.
@@ -106,6 +115,7 @@ def ensure_grayscale(img):
     return img_gray
 
 
+@profile
 def ensure_float01(img, dtype=np.float32):
     """ Ensure that an image is encoded using a float properly """
     if img.dtype.kind in ('i', 'u'):
@@ -145,6 +155,7 @@ def get_num_channels(img):
     return nChannels
 
 
+@profile
 def make_channels_comparable(img1, img2):
     """
     Broadcasts image arrays so they can have elementwise operations applied
@@ -192,6 +203,7 @@ def make_channels_comparable(img1, img2):
     return img1, img2
 
 
+@profile
 def overlay_alpha_images(img1, img2):
     """
     places img1 on top of img2 respecting alpha channels
@@ -207,6 +219,7 @@ def overlay_alpha_images(img1, img2):
     c1 = get_num_channels(img1)
     c2 = get_num_channels(img2)
     if c1 == 4:
+        # alpha1 = np.ascontiguousarray(img1[:, :, 3])
         alpha1 = img1[:, :, 3]
     else:
         alpha1 = np.ones(img1.shape[0:2], dtype=img1.dtype)
@@ -219,27 +232,31 @@ def overlay_alpha_images(img1, img2):
     rgb1 = img1[:, :, 0:3]
     rgb2 = img2[:, :, 0:3]
 
-    alpha3 = alpha1 + alpha2 * (1 - alpha1)
-    rgb3 = rgb1 * alpha1[..., None] + rgb2 * alpha2[..., None]
+    alpha1_ = alpha1[..., None]
+    alpha2_ = alpha2[..., None]
+    alpha3_ = alpha1_ + alpha2_ * (1 - alpha1_)
 
-    numer1 = (rgb1 * alpha1[..., None])
-    numer2 = (rgb2 * alpha2[..., None] * (1.0 - alpha1[..., None]))
-    rgb3 = (numer1 + numer2) / alpha3[..., None]
+    # rgb3 = rgb1 * alpha1_ + rgb2 * alpha2_
+
+    numer1 = (rgb1 * alpha1_)
+    numer2 = (rgb2 * alpha2_ * (1.0 - alpha1_))
+    rgb3 = (numer1 + numer2) / alpha3_
     return rgb3
 
 
+@profile
 def make_heatmask(mask, cmap='plasma'):
     """
     Colorizes a single-channel intensity mask (with an alpha channel)
     """
-    import matplotlib as mpl
+    # import matplotlib as mpl
     # current_backend = mpl.get_backend()
-    for backend in ['Qt5Agg', 'Agg']:
-        try:
-            mpl.use(backend, warn=True, force=False)
-            break
-        except Exception:
-            pass
+    # for backend in ['Qt5Agg', 'Agg']:
+    #     try:
+    #         mpl.use(backend, warn=True, force=False)
+    #         break
+    #     except Exception:
+    #         pass
     import matplotlib.pyplot as plt
     assert len(mask.shape) == 2
     mask = ensure_float01(mask)
@@ -249,6 +266,7 @@ def make_heatmask(mask, cmap='plasma'):
     return heatmask
 
 
+@profile
 def overlay_heatmask(img, mask, alpha=.9, cmap='plasma'):
     """
     Draws a heatmask on an image using a single-channel intensity mask.
