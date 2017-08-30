@@ -68,6 +68,8 @@ class FishDetector(object):
                 'factor': 4.0,
                 'min_size': 50,
                 'diff_thresh': 19,
+                'smooth_ksize': None,
+                'local_threshold': True,
             })
         else:
             self.config.update({
@@ -75,6 +77,8 @@ class FishDetector(object):
                 'min_size': 2000,
                 'n_training_frames': 30,
                 'gmm_thresh': 30,
+                'smooth_ksize': (5, 5),
+                'local_threshold': False,
             })
 
         self.config.update(kwargs)
@@ -95,17 +99,18 @@ class FishDetector(object):
         #     detectShadows=False
         # )
 
-    def apply(self, img):
+    def apply(self, img, return_info=True):
         """
         Detects the objects in the image and update the background model.
 
         Args:
             img (ndarray): image to perform detection on
+            return_info (bool): returns intermediate plotting data if True
 
         Returns:
-            detections, mask : list of dicts, dict of ndarrays
-                a list of detections and a dict of intermediate processing
-                stages for algorithm visualization.
+            detections, masks : list of dicts, dict of ndarrays
+                detection dicts and a dict of intermediate processing stages
+                for algorithm visualization.
 
         Doctest:
             >>> import sys
@@ -115,40 +120,44 @@ class FishDetector(object):
             >>> detections, masks = self.apply(img)
             >>> print('detections = {!r}'.format(detections))
             >>> draw_img = DrawHelper.draw_detections(img, detections, masks)
-            >>> import plottool as pt
-            >>> pt.qtensure()
-            >>> pt.imshow(draw_img)
-
-        Ignore:
-            detections['box_points']
+            >>> from matplotlib import pyplot as plt
+            >>> plt.imshow(cv2.cvtColor(draw_img, cv2.COLOR_BGR2RGB))
+            >>> plt.gca().grid(False)
+            >>> plt.show()
         """
+        masks = {}
         # Downsample and convert to grayscale
         img_, upfactor = self.preprocess_image(img)
 
         # Run detection / update background model
-        orig_mask = self.background_model.apply(img_)
+        mask = self.background_model.apply(img_)
+        if return_info:
+            masks['orig'] = mask.copy()
+
+        if self.config['local_threshold']:
+            # Refine initial detections
+            mask = self.local_threshold_mask(img_, mask)
+            if return_info:
+                masks['local'] = mask.copy()
 
         # Remove noise
-        if self.config['bg_algo'] == 'gmm':
-            post_mask = self.postprocess_mask(orig_mask.copy())
-        else:
-            post_mask = orig_mask
+        if self.config['smooth_ksize'] is not None:
+            mask = self.postprocess_mask(mask)
+            if return_info:
+                masks['post'] = mask.copy()
 
         # Find detections using CC algorithm
-        detections = list(self.masked_detect(post_mask))
+        detections = list(self.masked_detect(mask))
 
         if self.config['factor'] != 1.0:
             # Upscale back to input img coordinates (to agree with camera calib)
             self.upscale_detections(detections, upfactor)
 
-        masks = {
-            'orig': orig_mask,
-            'post': post_mask,
-        }
         return detections, masks
 
     def postprocess_mask(self, mask):
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        ksize = self.config['smooth_ksize']
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, ksize)
         # opening is erosion followed by dilation
         mask = cv2.erode(src=mask, kernel=kernel, dst=mask)
         mask = cv2.dilate(src=mask, kernel=kernel, dst=mask)
@@ -193,7 +202,7 @@ class FishDetector(object):
             img_ = img
         return img_, upfactor
 
-    def masked_detect(self, mask):
+    def masked_detect(self, mask, **kwargs):
         """
         Find pixel locs of each cc and determine if its a valid detection
 
@@ -209,11 +218,12 @@ class FishDetector(object):
         # Filter ccs to generate only "good" detections
         for cc_label in range(1, n_ccs):
             cc = (cc_mask == cc_label)
-            detection = self.filter_detection(cc)
+            detection = self.filter_detection(cc, **kwargs)
             if detection is not None:
                 yield detection
 
-    def filter_detection(self, cc):
+    def filter_detection(self, cc, filter_size=True, filter_border=True,
+                         filter_aspect=True):
         """
         Creates a detection from a CC-mask, or returns None if it is filtered.
 
@@ -230,22 +240,24 @@ class FishDetector(object):
         # note, `np.where` returns coords in (r, c)
         cc_y, cc_x = np.where(cc)
 
-        # Remove small regions
-        n_pixels = len(cc_x)
-        if n_pixels < self.config['min_size']:
-            return None
+        if filter_size:
+            # Remove small regions
+            n_pixels = len(cc_x)
+            if n_pixels < self.config['min_size']:
+                return None
 
-        # Define thresholds to filter edges
-        minx_lim, miny_lim = self.config['edge_trim']
-        maxx_lim = cc.shape[1] - minx_lim
-        maxy_lim = cc.shape[0] - miny_lim
+        if filter_border:
+            # Define thresholds to filter edges
+            minx_lim, miny_lim = self.config['edge_trim']
+            maxx_lim = cc.shape[1] - minx_lim
+            maxy_lim = cc.shape[0] - miny_lim
 
-        # Filter objects detected on the edge of the image region
-        minx, maxx = cc_x.min(), cc_x.max()
-        miny, maxy = cc_y.min(), cc_y.max()
-        if any([minx < minx_lim, maxx > maxx_lim,
-                miny < miny_lim, maxy > maxy_lim]):
-            return None
+            # Filter objects detected on the edge of the image region
+            minx, maxx = cc_x.min(), cc_x.max()
+            miny, maxy = cc_y.min(), cc_y.max()
+            if any([minx < minx_lim, maxx > maxx_lim,
+                    miny < miny_lim, maxy > maxy_lim]):
+                return None
 
         # generate the valid detection
         points = np.vstack([cc_x, cc_y]).T
@@ -256,10 +268,11 @@ class FishDetector(object):
         w, h = oriented_bbox.extent
 
         # Filter objects without fishy aspect ratios
-        ar = max([(w / h), (h / w)])
-        if any([ar < self.config['min_aspect'],
-                ar > self.config['max_aspect']]):
-            return None
+        if filter_aspect:
+            ar = max([(w / h), (h / w)])
+            if any([ar < self.config['min_aspect'],
+                    ar > self.config['max_aspect']]):
+                return None
 
         detection = {
             # 'points': points,
@@ -270,7 +283,24 @@ class FishDetector(object):
         }
         return detection
 
-    def refine_local_threshold(self, img_, detection, post_mask):
+    def local_threshold_mask(self, img_, post_mask):
+        refined_mask = post_mask.copy()
+        # refined_mask = np.zeros(post_mask.shape, dtype=np.uint8)
+
+        # Generate a set of inital detections
+        detections = list(self.masked_detect(post_mask, filter_border=False,
+                                             filter_aspect=False))
+        # Sort detections such that the largest detections are processed first,
+        # so that the large fish do not remove smaller fish.
+        areas = np.array([np.prod(det['oriented_bbox'].extent)
+                          for det in detections])
+        sortx = np.argsort(areas)
+        for detection in np.take(detections, sortx):
+            refined_mask = self.refine_local_threshold(img_, refined_mask,
+                                                       detection)
+        return refined_mask
+
+    def refine_local_threshold(self, img_, refined_mask, detection):
         """
         Function to perform local threshold background subtraction on all
         individual fish, with boxed coordinates set by coords.
@@ -291,15 +321,14 @@ class FishDetector(object):
             >>> from gmm_online_background_subtraction import *
             >>> self, img = demodata(target_step='detect', target_frame_num=7)
             >>> img_ = self.preprocess_image(img)[0]
-            >>> post_mask = self.background_model.apply(img_)
-            >>> detection = list(self.masked_detect(post_mask))[0]
-
+            >>> refined_mask = self.background_model.apply(img_).copy()
+            >>> detection = list(self.masked_detect(refined_mask))[0]
         """
-        refined = post_mask.copy()
-
         center_c, center_r = map(int, map(round, detection['oriented_bbox'].center))
         # Extract a padded region around the detection
-        radius = int(round(max(detection['oriented_bbox'].extent)))
+        # Use 2 * the height of the rectangle as the radius
+        radius = int(round(detection['oriented_bbox'].extent[1] * 2))
+        # radius = int(round(max(detection['oriented_bbox'].extent) * 2))
         r1 = max(center_r - radius, 0)
         c1 = max(center_c - radius, 0)
         r2 = min(center_r + radius, img_.shape[0])
@@ -310,17 +339,20 @@ class FishDetector(object):
         mu, sigma = scipy.stats.norm.fit(chip.ravel())
         level = mu + sigma
 
+        # Remove objects with a total number of pixels below the set minn at
+        # the beginning, while keeping those that are bordering (includes
+        # diagonals) the 'fish', which is the largest.
         sub_mask = np.zeros(chip.shape, dtype=np.uint8)
         sub_mask[chip > level] = 255
         sub_ccs, sub_labels = cv2.connectedComponents(sub_mask, connectivity=4)
 
-        refined[r1:r2, c1:c2][sub_labels > 0] = 255
+        hist, bins = np.histogram(sub_labels[sub_labels > 0].ravel(),
+                                  bins=np.arange(1, sub_ccs + 1))
+        largest_label = bins[hist.argmax()]
 
-        # Remove objects with a total number of pixels below the set minn at
-        # the beginning, while keeping those that are bordering (includes diagonals)
-        # the 'fish', which is the largest.
-        # cc = detection['cc']
-        pass
+        # Choose only one of these CCs
+        refined_mask[r1:r2, c1:c2][sub_labels == largest_label] = 255
+        return refined_mask
 
 
 class MedianBackgroundSubtractor(object):
@@ -581,7 +613,7 @@ class FishStereoTriangulationAssignment(object):
         pts2_3d = RT2.dot(to_homog(world_pts)).T
         return pts1_3d, pts2_3d, errors, fishlen
 
-    def minimum_weight_assignment(self, assign_errors):
+    def minimum_weight_assignment(self, cost_errors):
         """
         Finds optimal assignment of left-camera to right-camera detections
 
@@ -591,19 +623,19 @@ class FishStereoTriangulationAssignment(object):
             >>> sys.path.append('/home/joncrall/code/VIAME/plugins/camtrawl/python')
             >>> from gmm_online_background_subtraction import *
             >>> self = FishStereoTriangulationAssignment()
-            >>> assign_errors = np.array([
+            >>> cost_errors = np.array([
             >>>     [9, 2, 1, 9],
             >>>     [4, 1, 5, 5],
             >>>     [9, 9, 2, 4],
             >>> ])
-            >>> assign1 = self.minimum_weight_assignment(assign_errors)
-            >>> assign2 = self.minimum_weight_assignment(assign_errors.T)
+            >>> assign1 = self.minimum_weight_assignment(cost_errors)
+            >>> assign2 = self.minimum_weight_assignment(cost_errors.T)
         """
-        n1, n2 = assign_errors.shape
+        n1, n2 = cost_errors.shape
         n = max(n1, n2)
         # Embed the [n1 x n2] matrix in a padded (with inf) [n x n] matrix
         cost_matrix = np.full((n, n), fill_value=np.inf)
-        cost_matrix[0:n1, 0:n2] = assign_errors
+        cost_matrix[0:n1, 0:n2] = cost_errors
 
         # Find an effective infinite value for infeasible assignments
         is_infeasible = np.isinf(cost_matrix)
@@ -629,25 +661,35 @@ class FishStereoTriangulationAssignment(object):
             >>> import sys
             >>> sys.path.append('/home/joncrall/code/VIAME/plugins/camtrawl/python')
             >>> from gmm_online_background_subtraction import *
-            >>> detections1, detections2, cal = demodata('triangulate')
+            >>> detections1, detections2, cal = demodata(target_step='triangulate', target_frame_num=6)
             >>> self = FishStereoTriangulationAssignment()
-            >>> assignment, assign_data = self.find_matches(cal, detections1, detections2)
+            >>> assignment, assign_data, cand_errors = self.find_matches(cal, detections1, detections2)
         """
         n_detect1, n_detect2 = len(detections1), len(detections2)
-        assign_world_pts = {}
-        assign_fishlen = {}
+        print('n_detect1 = {!r}'.format(n_detect1))
+        print('n_detect2 = {!r}'.format(n_detect2))
+        cand_world_pts = {}
+        cand_fishlen = {}
+        cand_rang = {}
 
         # Initialize matrix of reprojection errors
-        assign_errors = np.full((n_detect1, n_detect2), fill_value=np.inf)
+        cost_errors = np.full((n_detect1, n_detect2), fill_value=np.inf)
+        cand_errors = np.full((n_detect1, n_detect2), fill_value=np.inf)
 
         # Find the liklihood that each pair of detections matches by
         # triangulating and then measuring the reprojection error.
         for (i, det1), (j, det2) in it.product(enumerate(detections1),
                                                enumerate(detections2)):
-
             # Triangulate assuming det1 and det2 match, but return the
             # reprojection error so we can check if this assumption holds
             pts1_3d, pts2_3d, errors, fishlen = self.triangulate(cal, det1, det2)
+            error = errors.mean()
+
+            # Mark the pair (i, j) as a potential candidate match
+            cand_world_pts[(i, j)] = pts1_3d
+            cand_errors[i, j] = error
+            cand_fishlen[(i, j)] = fishlen
+            cand_rang[(i, j)] = pts1_3d.T[2].mean()
 
             # Check chirality
             # Both Z-coordinates must be positive (i.e. in front the cameras)
@@ -666,29 +708,27 @@ class FishStereoTriangulationAssignment(object):
             else:
                 error_thresh = max_error[0]
 
-            error = errors.mean()
             if error  >= error_thresh:
                 # Ignore correspondences with high reprojection error
                 continue
 
-            # Mark the pair (i, j) as a potential candidate match
-            assign_world_pts[(i, j)] = pts1_3d
-            assign_errors[i, j] = error
-            assign_fishlen[(i, j)] = fishlen
+            cost_errors[i, j] = error
 
         # Find the matching with minimum reprojection error, such that each
         # detection in one camera can match at most one detection in the other.
-        assignment = self.minimum_weight_assignment(assign_errors)
+        assignment = self.minimum_weight_assignment(cost_errors)
 
         # get associated data with each assignment
         assign_data = [
             {
-                'fishlen': assign_fishlen[(i, j)],
-                'error': assign_errors[(i, j)],
+                'ij': (i, j),
+                'fishlen': cand_fishlen[(i, j)],
+                'error': cand_errors[(i, j)],
+                'range': cand_rang[(i, j)],
             }
             for i, j in assignment
         ]
-        return assignment, assign_data
+        return assignment, assign_data, cand_errors
 
 
 class DrawHelper(object):
@@ -701,20 +741,23 @@ class DrawHelper(object):
         # Upscale masks to original image size
         dsize = tuple(img.shape[0:2][::-1])
         shape = img.shape[0:2]
-        if 'orig' in masks:
-            orig_mask = cv2.resize(masks['orig'], dsize)
-            shape = orig_mask.shape[0:2]
-        if 'post' in masks:
-            post_mask = cv2.resize(masks['post'], dsize)
-            shape = post_mask.shape[0:2]
+
+        # Align all masks with the image size
+        masks2 = {
+            k: cv2.resize(v, dsize, interpolation=cv2.INTER_NEAREST)
+            for k, v in masks.items()
+        }
 
         # Create a heatmap for detections
         draw_mask = np.zeros(shape, dtype=np.float)
 
-        if 'orig' in masks:
-            draw_mask[orig_mask > 0] = .2
-        if 'post' in masks:
-            draw_mask[post_mask > 0] = .75
+        if 'orig' in masks2:
+            draw_mask[masks2['orig'] > 0] = .4
+        if 'local' in masks2:
+            draw_mask[masks2['local'] > 0] = .65
+        if 'post' in masks2:
+            draw_mask[masks2['post'] > 0] = .85
+
         for n, detection in enumerate(detections, start=1):
             cc = cv2.resize(detection['cc'].astype(np.uint8), dsize)
             draw_mask[cc > 0] = 1.0
@@ -736,7 +779,9 @@ class DrawHelper(object):
     @staticmethod
     def draw_stereo_detections(img1, detections1, masks1,
                                img2, detections2, masks2,
-                               assignment=None, assign_data=None):
+                               assignment=None, assign_data=None,
+                               cand_errors=None):
+        import textwrap
         BGR_RED = (0, 0, 255)
         line_color = BGR_RED
         text_color = BGR_RED
@@ -764,7 +809,39 @@ class DrawHelper(object):
                 y += (h + ypad)
             return img
 
-        if assignment:
+        if assignment is not None and len(cand_errors) > 0:
+            for j in range(cand_errors.shape[1]):
+                i = np.argmin(cand_errors[:, j])
+                if (i, j) in assignment or (j, i) in assignment:
+                    continue
+                error = cand_errors[i, j]
+                # if not np.isinf(error):
+                center1 = np.array(detections1[i]['oriented_bbox'].center)
+                center2 = np.array(detections2[j]['oriented_bbox'].center)
+
+                # Offset center2 to the right image
+                center2_ = center2 + [draw1.shape[1], 0]
+
+                center1 = tuple(center1.astype(np.int))
+                center2_ = tuple(center2_.astype(np.int))
+
+                BGR_PURPLE = (255, 0, 255)
+
+                stacked = cv2.line(stacked, center1, center2_,
+                                   color=BGR_PURPLE,
+                                   lineType=cv2.LINE_AA,
+                                   thickness=1)
+                text = textwrap.dedent(
+                    '''
+                    error = {error:.2f}
+                    '''
+                ).strip().format(error=error)
+
+                stacked = putMultiLineText(stacked, text, org=center2_,
+                                           fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                                           fontScale=1.5, color=BGR_PURPLE,
+                                           thickness=2, lineType=cv2.LINE_AA)
+
             for (i, j), info in zip(assignment, assign_data):
 
                 center1 = np.array(detections1[i]['oriented_bbox'].center)
@@ -780,11 +857,11 @@ class DrawHelper(object):
                                    lineType=cv2.LINE_AA,
                                    thickness=2)
 
-                import textwrap
                 text = textwrap.dedent(
                     '''
                     len = {fishlen:.2f}cm
                     error = {error:.2f}
+                    range = {range:.2f}mm
                     '''
                 ).strip().format(**info)
 
@@ -892,7 +969,9 @@ def demodata(dataset=1, target_step='detect', target_frame_num=7):
             # import vtool as vt
             import ubelt as ub
             # stacked = vt.stack_images(masks1['draw'], masks2['draw'], vert=False)[0]
-            stacked = np.hstack([masks1['draw'], masks2['draw']])
+            # stacked = np.hstack([masks1['draw'], masks2['draw']])
+            stacked = DrawHelper.draw_stereo_detections(img1, detections1, masks1,
+                                                        img2, detections2, masks2)
             dpath = ub.ensuredir('out')
             cv2.imwrite(dpath + '/mask{}_draw.png'.format(frame_num), stacked)
             cv2.imwrite(dpath + '/mask{}_{}_draw.png'.format(frame_id, frame_num), stacked)
@@ -912,44 +991,70 @@ def demo():
 
     dpath = ub.ensuredir('out')
 
-    if 0:
+    # bg_algo = 'median'
+    bg_algo = 'gmm'
+
+    if bg_algo == 'gmm':
         # Use GMM based model
-        stride = 1
+        stride = 2
         gmm_params = {
+            'bg_algo': bg_algo,
             'n_training_frames': 6,
             'gmm_thresh': 20,
             'factor': 4,
             'min_size': 1000,
-            'edge_trim': [10, 10],
+            'edge_trim': [12, 12],
+            'smooth_ksize': (5, 5),
+            'local_threshold': False,
         }
         gmm_params = {
-            'n_training_frames': 30,
-            'gmm_thresh': 20,
+            'bg_algo': bg_algo,
+            'n_training_frames': 200,
+            'gmm_thresh': 40,
             'factor': 2,
-            'min_size': 1000,
-            'edge_trim': [12, 12],
+            'min_size': 200,
+            'edge_trim': [2, 2],
+            # 'smooth_ksize': None,
+            'smooth_ksize': (3, 3),
+            'local_threshold': False,
         }
         triangulate_params = {
-            'max_err': [50, 50],
+            'max_err': [200, 200],
         }
-        detector1 = FishDetector(bg_algo='gmm', **gmm_params)
-        detector2 = FishDetector(bg_algo='gmm', **gmm_params)
-    else:
-        # Use ??? based model
+        detector1 = FishDetector(**gmm_params)
+        detector2 = FishDetector(**gmm_params)
+    elif bg_algo == 'median':
+        # Use median update difference based model
+        detect_params = {
+            'bg_algo': bg_algo,
+            'factor': 4,
+            'min_size': 50,
+            # 'edge_trim': [10, 10],
+            'edge_trim': [2, 2],
+            # 'smooth_ksize': (5, 5),
+            'smooth_ksize': None,
+            'local_threshold': True,
+        }
         triangulate_params = {
             'max_err': [6, 14],
         }
-        detect_params = {
-            'factor': 4,
-            'min_size': 50,
-            'edge_trim': [10, 10],
-        }
         stride = 2
-        detector1 = FishDetector(diff_thresh=19, bg_algo='median', **detect_params)
-        detector2 = FishDetector(diff_thresh=15, bg_algo='median', **detect_params)
+        detector1 = FishDetector(diff_thresh=19, **detect_params)
+        detector2 = FishDetector(diff_thresh=15, **detect_params)
+
+    triangulator = FishStereoTriangulationAssignment(**triangulate_params)
+
+    import pprint
+    print('Detector1 Config: ' + pprint.pformat(detector1.config, indent=4))
+    print('Detector2 Config: ' + pprint.pformat(detector2.config, indent=4))
+    print('Triangulate Config: ' + pprint.pformat(triangulator.config, indent=4))
+
+    pprint.pformat(detector2.config)
 
     stream1 = FrameStream(image_path_list1, stride=stride)
     stream2 = FrameStream(image_path_list2, stride=stride)
+
+    n_total = 0
 
     _iter = enumerate(zip(stream1, stream2))
     for frame_num, ((frame_id1, img1), (frame_id2, img2)) in _iter:
@@ -962,19 +1067,23 @@ def demo():
 
         # stacked = vt.stack_images(masks1['draw'], masks2['draw'], vert=False)[0]
         if len(detections1) > 0 or len(detections2) > 0:
-            self = FishStereoTriangulationAssignment(**triangulate_params)
-            assignment, assign_data = self.find_matches(cal, detections1, detections2)
+            assignment, assign_data, cand_errors = triangulator.find_matches(
+                cal, detections1, detections2)
+            n_total += len(assignment)
+            print('n_total = {!r}'.format(n_total))
         else:
+            cand_errors = None
             assignment, assign_data = None, None
 
         # if assignment:
         stacked = DrawHelper.draw_stereo_detections(img1, detections1, masks1,
                                                     img2, detections2, masks2,
-                                                    assignment, assign_data)
-        cv2.imwrite(dpath + '/mask{}_draw.png'.format(frame_id),
-                    stacked)
+                                                    assignment, assign_data,
+                                                    cand_errors)
+        cv2.imwrite(dpath + '/mask{}_draw.png'.format(frame_id), stacked)
         # if frame_num == 7:
         #     break
+    print('n_total = {!r}'.format(n_total))
 
 if __name__ == '__main__':
     demo()
