@@ -95,6 +95,58 @@ class FishDetector(object):
         #     detectShadows=False
         # )
 
+    def apply(self, img):
+        """
+        Detects the objects in the image and update the background model.
+
+        Args:
+            img (ndarray): image to perform detection on
+
+        Returns:
+            detections, mask : list of dicts, dict of ndarrays
+                a list of detections and a dict of intermediate processing
+                stages for algorithm visualization.
+
+        Doctest:
+            >>> import sys
+            >>> sys.path.append('/home/joncrall/code/VIAME/plugins/camtrawl/python')
+            >>> from gmm_online_background_subtraction import *
+            >>> self, img = demodata(target_step='detect', target_frame_num=7)
+            >>> detections, masks = self.apply(img)
+            >>> print('detections = {!r}'.format(detections))
+            >>> draw_img = DrawHelper.draw_detections(img, detections, masks)
+            >>> import plottool as pt
+            >>> pt.qtensure()
+            >>> pt.imshow(draw_img)
+
+        Ignore:
+            detections['box_points']
+        """
+        # Downsample and convert to grayscale
+        img_, upfactor = self.preprocess_image(img)
+
+        # Run detection / update background model
+        orig_mask = self.background_model.apply(img_)
+
+        # Remove noise
+        if self.config['bg_algo'] == 'gmm':
+            post_mask = self.postprocess_mask(orig_mask.copy())
+        else:
+            post_mask = orig_mask
+
+        # Find detections using CC algorithm
+        detections = list(self.masked_detect(post_mask))
+
+        if self.config['factor'] != 1.0:
+            # Upscale back to input img coordinates (to agree with camera calib)
+            self.upscale_detections(detections, upfactor)
+
+        masks = {
+            'orig': orig_mask,
+            'post': post_mask,
+        }
+        return detections, masks
+
     def postprocess_mask(self, mask):
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         # opening is erosion followed by dilation
@@ -141,104 +193,84 @@ class FishDetector(object):
             img_ = img
         return img_, upfactor
 
-    def apply(self, img):
-        """
-        Example:
-            >>> import sys
-            >>> sys.path.append('/home/joncrall/code/VIAME/plugins/camtrawl/python')
-            >>> from gmm_online_background_subtraction import *
-            >>> self, img = demodata(target_step='detect', target_frame_num=7)
-            >>> detections, masks = self.apply(img)
-            >>> print('detections = {!r}'.format(detections))
-            >>> draw_img = DrawHelper.draw_detections(img, detections, masks)
-            >>> import plottool as pt
-            >>> pt.qtensure()
-            >>> pt.imshow(draw_img)
-
-        Ignore:
-            detections['box_points']
-        """
-        # Downsample and convert to grayscale
-        img_, upfactor = self.preprocess_image(img)
-
-        # Run detection / update background model
-        orig_mask = self.background_model.apply(img_)
-
-        # Remove noise
-        if self.config['bg_algo'] == 'gmm':
-            post_mask = self.postprocess_mask(orig_mask.copy())
-        else:
-            post_mask = orig_mask
-
-        # Find detections using CC algorithm
-        detections = list(self.masked_detect(post_mask))
-
-        if self.config['factor'] != 1.0:
-            # Upscale back to input img coordinates (to agree with camera calib)
-            self.upscale_detections(detections, upfactor)
-
-        masks = {
-            'orig': orig_mask,
-            'post': post_mask,
-        }
-        return detections, masks
-
     def masked_detect(self, mask):
         """
         Find pixel locs of each cc and determine if its a valid detection
+
+        Args:
+            mask (ndarray): mask where non-zero pixels indicate all candidate
+                objects
         """
         img_h, img_w = mask.shape
 
         # 4-way connected compoment algorithm
         n_ccs, cc_mask = cv2.connectedComponents(mask, connectivity=4)
 
-        # Define thresholds to filter edges
-        minx_lim, miny_lim = self.config['edge_trim']
-        maxx_lim = img_w - minx_lim
-        maxy_lim = img_h - miny_lim
-
         # Filter ccs to generate only "good" detections
         for cc_label in range(1, n_ccs):
             cc = (cc_mask == cc_label)
-            # note, `np.where` returns coords in (r, c)
-            cc_y, cc_x = np.where(cc)
+            detection = self.filter_detection(cc)
+            if detection is not None:
+                yield detection
 
-            # Remove small regions
-            n_pixels = len(cc_x)
-            if n_pixels < self.config['min_size']:
-                continue
+    def filter_detection(self, cc):
+        """
+        Creates a detection from a CC-mask, or returns None if it is filtered.
 
-            # Filter objects detected on the edge of the image region
-            minx, maxx = cc_x.min(), cc_x.max()
-            miny, maxy = cc_y.min(), cc_y.max()
-            if any([minx < minx_lim, maxx > maxx_lim,
-                    miny < miny_lim, maxy > maxy_lim]):
-                continue
+        Args:
+            cc (ndarray): mask where non-zero pixels indicate a single
+                candidate object
 
-            # generate the valid detection
-            points = np.vstack([cc_x, cc_y]).T
+        Returns:
+            detection: dict or None
+                a dictionary containing mask and bounding box information about
+                a single object detection. If the conditions are not met,
+                returns None.
+        """
+        # note, `np.where` returns coords in (r, c)
+        cc_y, cc_x = np.where(cc)
 
-            # Find a minimum oriented bounding box around the points
-            hull = cv2.convexHull(points)
-            oriented_bbox = OrientedBBox(*cv2.minAreaRect(hull))
-            w, h = oriented_bbox.extent
+        # Remove small regions
+        n_pixels = len(cc_x)
+        if n_pixels < self.config['min_size']:
+            return None
 
-            # Filter objects without fishy aspect ratios
-            ar = max([(w / h), (h / w)])
-            if any([ar < self.config['min_aspect'],
-                    ar > self.config['max_aspect']]):
-                continue
+        # Define thresholds to filter edges
+        minx_lim, miny_lim = self.config['edge_trim']
+        maxx_lim = cc.shape[1] - minx_lim
+        maxy_lim = cc.shape[0] - miny_lim
 
-            detection = {
-                # 'points': points,
-                'box_points': cv2.boxPoints(oriented_bbox),
-                'oriented_bbox': oriented_bbox,
-                'cc': cc,
-                'hull': hull[:, 0, :],
-            }
-            yield detection
+        # Filter objects detected on the edge of the image region
+        minx, maxx = cc_x.min(), cc_x.max()
+        miny, maxy = cc_y.min(), cc_y.max()
+        if any([minx < minx_lim, maxx > maxx_lim,
+                miny < miny_lim, maxy > maxy_lim]):
+            return None
 
-    def local_thresh2(self, img_, detection, post_mask):
+        # generate the valid detection
+        points = np.vstack([cc_x, cc_y]).T
+
+        # Find a minimum oriented bounding box around the points
+        hull = cv2.convexHull(points)
+        oriented_bbox = OrientedBBox(*cv2.minAreaRect(hull))
+        w, h = oriented_bbox.extent
+
+        # Filter objects without fishy aspect ratios
+        ar = max([(w / h), (h / w)])
+        if any([ar < self.config['min_aspect'],
+                ar > self.config['max_aspect']]):
+            return None
+
+        detection = {
+            # 'points': points,
+            'box_points': cv2.boxPoints(oriented_bbox),
+            'oriented_bbox': oriented_bbox,
+            'cc': cc,
+            'hull': hull[:, 0, :],
+        }
+        return detection
+
+    def refine_local_threshold(self, img_, detection, post_mask):
         """
         Function to perform local threshold background subtraction on all
         individual fish, with boxed coordinates set by coords.
@@ -247,9 +279,7 @@ class FishDetector(object):
         threshold equal to the mean + 1*sigma of the gaussian fit to the
         histogram of the grayscale values in tempim.
 
-        Also, included in here is a routine to keep bordering objects to each
-        fish if it is on the diagonal, which i4mat_components does not do.  imN
-        replaces all the objects in im with the new 0/1 local objects.  imN
+        imN replaces all the objects in im with the new 0/1 local objects.  imN
         should be a more correct estimate of the actual object sizes.
 
         Ignore:
@@ -309,28 +339,35 @@ class MedianBackgroundSubtractor(object):
             >>> sys.path.append('/home/joncrall/code/VIAME/plugins/camtrawl/python')
             >>> from gmm_online_background_subtraction import *
             >>> #
-            >>> # plottool is my custom plotting library
-            >>> import plottool as pt
-            >>> pt.qtensure()
-            >>> #
+            >>> from matplotlib import pyplot as plt
             >>> image_path_list1, _, _ = demodata_input(dataset=2)
             >>> stream = FrameStream(image_path_list1, stride=1)
             >>> detector = FishDetector(bg_algo='median')
             >>> bgmodel = MedianBackgroundSubtractor()
             >>> def getimg(i):
             >>>     return detector.preprocess_image(stream[i][1])[0]
-            >>> step = 1
-            >>> for i in range(7, 7 + step * 9, step):
+            >>> start = 0
+            >>> num = 9
+            >>> step = 3
+            >>> for i in range(start, start + num, step):
             >>>     imgs = [getimg(i + j) for j in range(step)]
             >>>     masks = []
             >>>     bgs = []
             >>>     for img in imgs:
             >>>         masks.append(bgmodel.apply(img))
             >>>         bgs.append(bgmodel.bgimg.copy())
+            >>>     fig = plt.figure(i)
             >>>     for j, (img, mask, bg) in enumerate(zip(imgs, masks, bgs)):
-            >>>         pt.imshow(img,  fnum=i, pnum=(step, 3, 1 + step * j))
-            >>>         pt.imshow(mask, fnum=i, pnum=(step, 3, 2 + step * j))
-            >>>         pt.imshow(bg,   fnum=i, pnum=(step, 3, 3 + step * j))
+            >>>         ax = fig.add_subplot(step, 3, 1 + step * j)
+            >>>         ax.imshow(img, interpolation='nearest', cmap='gray')
+            >>>         ax.grid(False)
+            >>>         ax = fig.add_subplot(step, 3, 2 + step * j)
+            >>>         ax.imshow(mask)
+            >>>         ax.grid(False)
+            >>>         ax = fig.add_subplot(step, 3, 3 + step * j)
+            >>>         ax.imshow(bg, interpolation='nearest', cmap='gray')
+            >>>         ax.grid(False)
+            >>> plt.show()
         """
         # Subtract the previous background image and make a new one
         if bgmodel.bgimg is None:
@@ -548,7 +585,7 @@ class FishStereoTriangulationAssignment(object):
         """
         Finds optimal assignment of left-camera to right-camera detections
 
-        Example:
+        Doctest:
             >>> # Rows are detections in img1, cols are detections in img2
             >>> import sys
             >>> sys.path.append('/home/joncrall/code/VIAME/plugins/camtrawl/python')
@@ -587,7 +624,7 @@ class FishStereoTriangulationAssignment(object):
         """
         Match detections from the left camera to detections in the right camera
 
-        Example:
+        Doctest:
             >>> # Rows are detections in img1, cols are detections in img2
             >>> import sys
             >>> sys.path.append('/home/joncrall/code/VIAME/plugins/camtrawl/python')
