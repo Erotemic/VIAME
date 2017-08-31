@@ -1093,27 +1093,28 @@ def demo():
     # bg_algo = 'median'
     bg_algo = 'gmm'
 
-    DRAWING = 1
+    DRAWING = 0
     if bg_algo == 'gmm':
         # Use GMM based model
-        stride = 1
         gmm_params = {
             'bg_algo': bg_algo,
             'n_training_frames': 9999,
             # 'gmm_thresh': 20,
             'gmm_thresh': 30,
             'min_size': 800,
-            'edge_trim': [10, 10],
+            'edge_trim': [40, 40],
             'n_startup_frames': 3,
             'factor': 2,
-            # 'smooth_ksize': None,
+            'smooth_ksize': None,
             # 'smooth_ksize': (3, 3),
-            'smooth_ksize': (10, 10),  # wrt original image size
+            # 'smooth_ksize': (10, 10),  # wrt original image size
             'local_threshold': False,
         }
         triangulate_params = {
-            'max_err': [200, 200],
+            'max_err': [6, 14],
+            # 'max_err': [200, 200],
         }
+        stride = 2
         detector1 = FishDetector(**gmm_params)
         detector2 = FishDetector(**gmm_params)
     elif bg_algo == 'median':
@@ -1121,14 +1122,16 @@ def demo():
         detect_params = {
             'bg_algo': bg_algo,
             'factor': 4,
-            'min_size': 1500,
-            'edge_trim': [10, 10],
-            'smooth_ksize': (10, 10),
-            'local_threshold': True,
+            'min_size': 800,
+            'edge_trim': [40, 40],
+            # 'smooth_ksize': (10, 10),
+            'smooth_ksize': None,
+            # 'local_threshold': True,
+            'local_threshold': False,
         }
         triangulate_params = {
-            # 'max_err': [6, 14],
-            'max_err': [200, 200],
+            'max_err': [6, 14],
+            # 'max_err': [200, 200],
         }
         stride = 2
         detector1 = FishDetector(diff_thresh=19, **detect_params)
@@ -1208,10 +1211,15 @@ def demo():
 if __name__ == '__main__':
     r"""
     CommandLine:
-        python ~/code/VIAME/plugins/camtrawl/python/camtrawl_algos.py
-        ffmpeg -start_number 3662 -i out_haul83/mask0%d_draw.png -vcodec mpeg4 -framerate 2 haul83.avi
 
-        ffmpeg -y -f image2 -i out_haul83/%*.png -vcodec mpeg4 -vf "setpts=10*PTS" haul83.avi
+        workon_py2
+        source ~/code/VIAME/build/install/setup_viame.sh
+        export SPROKIT_PYTHON_MODULES=camtrawl_processes:kwiver.processes:viame.processes
+        export PYTHONPATH=$(pwd):$PYTHONPATH
+
+        python ~/code/VIAME/plugins/camtrawl/python/camtrawl_algos.py
+
+        ffmpeg -y -f image2 -i out_haul83/%*.png -vcodec mpeg4 -vf "setpts=10*PTS" haul83-results.avi
     """
     demo()
     # import utool as ut
