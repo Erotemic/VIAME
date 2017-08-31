@@ -49,8 +49,11 @@ def imscale(img, scale):
     new_scale = new_w / w, new_h / h
     new_dsize = (new_w, new_h)
 
-    # new_img = cv2.resize(img, new_dsize, interpolation=cv2.INTER_LANCZOS4)
-    new_img = cv2.resize(img, new_dsize, interpolation=cv2.INTER_LINEAR)
+    interpolation = cv2.INTER_LINEAR
+    # interpolation = cv2.INTER_CUBIC
+    # interpolation = cv2.INTER_LANCZOS4
+
+    new_img = cv2.resize(img, new_dsize, interpolation=interpolation)
     return new_img, new_scale
 
 
@@ -219,7 +222,6 @@ def overlay_alpha_images(img1, img2):
     c1 = get_num_channels(img1)
     c2 = get_num_channels(img2)
     if c1 == 4:
-        # alpha1 = np.ascontiguousarray(img1[:, :, 3])
         alpha1 = img1[:, :, 3]
     else:
         alpha1 = np.ones(img1.shape[0:2], dtype=img1.dtype)
@@ -235,8 +237,6 @@ def overlay_alpha_images(img1, img2):
     alpha1_ = alpha1[..., None]
     alpha2_ = alpha2[..., None]
     alpha3_ = alpha1_ + alpha2_ * (1 - alpha1_)
-
-    # rgb3 = rgb1 * alpha1_ + rgb2 * alpha2_
 
     numer1 = (rgb1 * alpha1_)
     numer2 = (rgb2 * alpha2_ * (1.0 - alpha1_))
@@ -280,3 +280,39 @@ def overlay_heatmask(img, mask, alpha=.9, cmap='plasma'):
     draw_img = overlay_alpha_images(heat_mask, img)
     draw_img = ensure_uint8(draw_img)
     return draw_img
+
+
+def grabcut(bgr_img, prior_mask, binary=True, num_iters=5):
+    """
+    Baseline opencv segmentation algorithm based on graph-cuts.
+
+    Referencs:
+        http://docs.opencv.org/trunk/doc/py_tutorials/py_imgproc/py_grabcut/py_grabcut.html
+    """
+    # Grab Cut Parameters
+    (h, w) = bgr_img.shape[0:2]
+    rect = (0, 0, w, h)
+
+    mode = cv2.GC_INIT_WITH_MASK
+    bgd_model = np.zeros((1, 13 * 5), np.float64)
+    fgd_model = np.zeros((1, 13 * 5), np.float64)
+    # Grab Cut Execution
+    post_mask = prior_mask.copy()
+    if binary:
+        is_pr_bgd = (post_mask == 0)
+        if np.all(is_pr_bgd) or not np.any(is_pr_bgd):
+            return post_mask
+        post_mask[post_mask > 0]  = cv2.GC_FGD
+        post_mask[post_mask == 0] = cv2.GC_PR_BGD
+
+    cv2.grabCut(bgr_img, post_mask, rect, bgd_model, fgd_model, num_iters, mode=mode)
+    if binary:
+        is_forground = (post_mask == cv2.GC_FGD) + (post_mask == cv2.GC_PR_FGD)
+        post_mask = np.where(is_forground, 255, 0).astype('uint8')
+    else:
+        label_colors = [       255,           170,            50,          0]
+        label_values = [cv2.GC_FGD, cv2.GC_PR_FGD, cv2.GC_PR_BGD, cv2.GC_BGD]
+        pos_list = [post_mask == value for value in label_values]
+        for pos, color in zip(pos_list, label_colors):
+            post_mask[pos] = color
+    return post_mask

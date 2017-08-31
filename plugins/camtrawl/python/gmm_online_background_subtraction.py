@@ -1,24 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 Reimplementation of matlab algorithms for fishlength detection in python.
-This is the first step of moving them into kwiver.
+The next step is to move them into kwiver.
 
-# Adjust the threshold value for left (thL) and right (thR) so code will
-# select most fish without including non-fish objects (e.g. the net)
-thL = 20
-thR = 20
-
-# Species classes
-# This is fixed for each training set, so it will remain the same throughout an entire survey
-# pollock, salmon unident., rockfish unident.
-sp_numbs = [21740, 23202, 30040]
-
-
-# number to increment between frames
-by_n = 1
-
-# Factor to reduce the size of the image for processing
-factor = 2
+TODO:
+    fix hard coded paths for doctests
 """
 from __future__ import division, print_function
 from collections import namedtuple
@@ -28,8 +14,9 @@ import numpy as np
 import scipy.optimize
 from imutils import ( # NOQA
     imscale, ensure_grayscale, overlay_heatmask, from_homog, to_homog,
-    downsample_average_blocks)
-from os.path import expanduser, basename, join
+    downsample_average_blocks, grabcut)
+from os.path import expanduser, basename, join, splitext
+import ubelt as ub
 
 try:
     import utool as ut
@@ -40,40 +27,6 @@ except ImportError:
 
 
 OrientedBBox = namedtuple('OrientedBBox', ('center', 'extent', 'angle'))
-
-
-def grabcut(bgr_img, prior_mask, binary=True, num_iters=5):
-    """
-    Referencs:
-        http://docs.opencv.org/trunk/doc/py_tutorials/py_imgproc/py_grabcut/py_grabcut.html
-    """
-    # Grab Cut Parameters
-    (h, w) = bgr_img.shape[0:2]
-    rect = (0, 0, w, h)
-
-    mode = cv2.GC_INIT_WITH_MASK
-    bgd_model = np.zeros((1, 13 * 5), np.float64)
-    fgd_model = np.zeros((1, 13 * 5), np.float64)
-    # Grab Cut Execution
-    post_mask = prior_mask.copy()
-    if binary:
-        is_pr_bgd = (post_mask == 0)
-        if np.all(is_pr_bgd) or not np.any(is_pr_bgd):
-            return post_mask
-        post_mask[post_mask > 0]  = cv2.GC_FGD
-        post_mask[post_mask == 0] = cv2.GC_PR_BGD
-
-    cv2.grabCut(bgr_img, post_mask, rect, bgd_model, fgd_model, num_iters, mode=mode)
-    if binary:
-        is_forground = (post_mask == cv2.GC_FGD) + (post_mask == cv2.GC_PR_FGD)
-        post_mask = np.where(is_forground, 255, 0).astype('uint8')
-    else:
-        label_colors = [       255,           170,            50,          0]
-        label_values = [cv2.GC_FGD, cv2.GC_PR_FGD, cv2.GC_PR_BGD, cv2.GC_BGD]
-        pos_list = [post_mask == value for value in label_values]
-        for pos, color in zip(pos_list, label_colors):
-            post_mask[pos] = color
-    return post_mask
 
 
 class FishDetector(object):
@@ -91,6 +44,9 @@ class FishDetector(object):
         bg_algo = kwargs.get('bg_algo', 'gmm')
 
         self.config = {
+            # number of frames before the background model is ready
+            'n_startup_frames': 1,
+
             # limits accepable targets to be within this region [padx, pady]
             # These are wrt the original image size
             'edge_trim': [12, 12],
@@ -179,7 +135,7 @@ class FishDetector(object):
         if return_info:
             masks['orig'] = mask.copy()
 
-        if self.n_iters < 6:
+        if self.n_iters < self.config['n_startup_frames']:
             # Skip the first few frames while the model is learning
             detections = []
         else:
@@ -472,7 +428,7 @@ class MedianBackgroundSubtractor(object):
             >>> from gmm_online_background_subtraction import *
             >>> #
             >>> from matplotlib import pyplot as plt
-            >>> image_path_list1, _, _ = demodata_input(dataset=2)
+            >>> image_path_list1, _, _ = demodata_input(dataset='haul83')
             >>> stream = FrameStream(image_path_list1, stride=1)
             >>> detector = FishDetector(bg_algo='median')
             >>> bgmodel = MedianBackgroundSubtractor()
@@ -549,7 +505,9 @@ class StereoCalibration(object):
         K2 = cal._make_intrinsic_matrix(cal.data['right']['intrinsic'])
         return K1, K2
 
-    def _make_intrinsic_matrix(cal, intrin):
+    @staticmethod
+    def _make_intrinsic_matrix(intrin):
+        """ convert intrinsic dict to matrix """
         fc = intrin['fc']
         cc = intrin['cc']
         alpha_c = intrin['alpha_c']
@@ -559,6 +517,58 @@ class StereoCalibration(object):
             [    0,               0,     1],
         ])
         return KK
+
+    @staticmethod
+    def _make_intrinsic_params(K):
+        """ convert intrinsic matrix to dict """
+        intrin = {}
+        fc = intrin['fc'] = np.zeros(2)
+        cc = intrin['cc'] = np.zeros(2)
+        [[fc[0], alpha_c_fc0, cc[0]],
+         [    _,       fc[1], cc[1]],
+         [    _,           _,     _]] = K
+        intrin['alpha_c'] = np.array([alpha_c_fc0 / fc[0]])
+        return intrin
+
+    @classmethod
+    def from_file(StereoCalibration, cal_fpath):
+        ext = splitext(cal_fpath)[1].lower()
+        if ext == '.mat':
+            return StereoCalibration.from_matfile(cal_fpath)
+        elif ext == '.npz':
+            return StereoCalibration.from_npzfile(cal_fpath)
+        else:
+            raise ValueError('unknown extension {}'.format(ext))
+
+    @classmethod
+    def from_npzfile(StereoCalibration, cal_fpath):
+        """
+        Doctest:
+            >>> import sys
+            >>> sys.path.append('/home/joncrall/code/VIAME/plugins/camtrawl/python')
+            >>> from gmm_online_background_subtraction import *
+            >>> cal_fpath = '/home/joncrall/data/camtrawl_stereo_sample_data/201608_calibration_data/selected/Camtrawl_2016.npz'
+            >>> cal = StereoCalibration.from_npzfile(cal_fpath)
+        """
+        data = dict(np.load(cal_fpath))
+        flat_dict = {}
+        flat_dict['om'] = cv2.Rodrigues(data['R'])[0].ravel()
+        flat_dict['T'] = data['T'].ravel()
+
+        K1 = data['cameraMatrixL']
+        intrin1 = StereoCalibration._make_intrinsic_params(K1)
+        flat_dict['fc_left'] = intrin1['fc']
+        flat_dict['cc_left'] = intrin1['cc']
+        flat_dict['alpha_c_left'] = intrin1['alpha_c']
+        flat_dict['kc_left'] = data['distCoeffsL'].ravel()
+
+        K2 = data['cameraMatrixR']
+        intrin2 = StereoCalibration._make_intrinsic_params(K2)
+        flat_dict['fc_right'] = intrin2['fc']
+        flat_dict['cc_right'] = intrin2['cc']
+        flat_dict['alpha_c_right'] = intrin2['alpha_c']
+        flat_dict['kc_right'] = data['distCoeffsR'].ravel()
+        return StereoCalibration._from_flat_dict(flat_dict)
 
     @classmethod
     def from_matfile(StereoCalibration, cal_fpath):
@@ -573,10 +583,7 @@ class StereoCalibration(object):
             >>> import sys
             >>> sys.path.append('/home/joncrall/code/VIAME/plugins/camtrawl/python')
             >>> from gmm_online_background_subtraction import *
-            >>> _, _, cal_fpath = demodata_input(dataset=1)
-            >>> cal = StereoCalibration.from_matfile(cal_fpath)
-            >>> print('cal = {}'.format(cal))
-            >>> _, _, cal_fpath = demodata_input(dataset=2)
+            >>> _, _, cal_fpath = demodata_input(dataset='test')
             >>> cal = StereoCalibration.from_matfile(cal_fpath)
             >>> print('cal = {}'.format(cal))
         """
@@ -590,7 +597,11 @@ class StereoCalibration(object):
             flat_dict = {k: v.ravel() for k, v in zip(keys, vals)}
         else:
             flat_dict = {key: cal_data[key].ravel() for key in keys}
+        return StereoCalibration._from_flat_dict(flat_dict)
 
+    @classmethod
+    def _from_flat_dict(StereoCalibration, flat_dict):
+        """ helper used by matlab and numpy readers """
         data = {
             'left': {
                 'extrinsic': {
@@ -1064,18 +1075,19 @@ class FrameStream(object):
             yield stream[i]
 
 
-def demodata_input(dataset=1):
+def demodata_input(dataset='test'):
     import glob
 
-    if dataset == 1:
+    if dataset == 'test':
         data_fpath = expanduser('~/data/autoprocess_test_set')
         cal_fpath = join(data_fpath, 'cal_201608.mat')
         img_path1 = join(data_fpath, 'image_data/left')
         img_path2 = join(data_fpath, 'image_data/right')
-    elif dataset == 2:
+    elif dataset == 'haul83':
         data_fpath = expanduser('~/data/camtrawl_stereo_sample_data/')
         # cal_fpath = join(data_fpath, 'code/Calib_Results_stereo_1608.mat')
-        cal_fpath = join(data_fpath, 'code/cal_201608.mat')
+        # cal_fpath = join(data_fpath, 'code/cal_201608.mat')
+        cal_fpath = join(data_fpath, '201608_calibration_data/selected/Camtrawl_2016.npz')
         img_path1 = join(data_fpath, 'Haul_83/left')
         img_path2 = join(data_fpath, 'Haul_83/right')
     else:
@@ -1087,7 +1099,7 @@ def demodata_input(dataset=1):
     return image_path_list1, image_path_list2, cal_fpath
 
 
-def demodata(dataset=1, target_step='detect', target_frame_num=7):
+def demodata(dataset='haul83', target_step='detect', target_frame_num=7):
     """
     Helper for doctests. Gets test data at different points in the pipeline.
     """
@@ -1097,7 +1109,7 @@ def demodata(dataset=1, target_step='detect', target_frame_num=7):
         target_frame_num = 7
     image_path_list1, image_path_list2, cal_fpath = demodata_input(dataset=dataset)
 
-    cal = StereoCalibration.from_matfile(cal_fpath)
+    cal = StereoCalibration.from_file(cal_fpath)
 
     detector1 = FishDetector()
     detector2 = FishDetector()
@@ -1124,7 +1136,6 @@ def demodata(dataset=1, target_step='detect', target_frame_num=7):
 
         if frame_num == target_frame_num:
             # import vtool as vt
-            import ubelt as ub
             # stacked = vt.stack_images(masks1['draw'], masks2['draw'], vert=False)[0]
             # stacked = np.hstack([masks1['draw'], masks2['draw']])
             stacked = DrawHelper.draw_stereo_detections(img1, detections1, masks1,
@@ -1139,12 +1150,11 @@ def demodata(dataset=1, target_step='detect', target_frame_num=7):
 
 
 def demo():
-    import ubelt as ub
-    dataset = 1
-    dataset = 2
+    # dataset = 'test'
+    dataset = 'haul83'
 
     image_path_list1, image_path_list2, cal_fpath = demodata_input(dataset=dataset)
-    cal = StereoCalibration.from_matfile(cal_fpath)
+    cal = StereoCalibration.from_file(cal_fpath)
 
     dpath = ub.ensuredir('out_{}'.format(dataset))
 
@@ -1153,15 +1163,16 @@ def demo():
 
     if bg_algo == 'gmm':
         # Use GMM based model
-        stride = 1
+        stride = 2
         gmm_params = {
             'bg_algo': bg_algo,
             'n_training_frames': 9999,
             # 'gmm_thresh': 20,
             'gmm_thresh': 30,
-            'factor': 4,
             'min_size': 800,
             'edge_trim': [10, 10],
+            'n_startup_frames': 3,
+            'factor': 2,
             # 'smooth_ksize': None,
             # 'smooth_ksize': (3, 3),
             'smooth_ksize': (10, 10),  # wrt original image size
@@ -1193,6 +1204,7 @@ def demo():
     triangulator = FishStereoTriangulationAssignment(**triangulate_params)
 
     import pprint
+    print('dataset = {!r}'.format(dataset))
     print('Detector1 Config: ' + pprint.pformat(detector1.config, indent=4))
     print('Detector2 Config: ' + pprint.pformat(detector2.config, indent=4))
     print('Triangulate Config: ' + pprint.pformat(triangulator.config, indent=4))
@@ -1206,13 +1218,12 @@ def demo():
     all_errors = []
     all_lengths = []
 
-    import ubelt as ub
     prog = ub.ProgIter(enumerate(zip(stream1, stream2)),
                        clearline=True,
                        length=len(stream1) // stride,
                        adjust=False)
     _iter = prog
-    # _iter = enumerate(zip(stream1, stream2))
+
     for frame_num, ((frame_id1, img1), (frame_id2, img2)) in _iter:
         assert frame_id1 == frame_id2
         frame_id = frame_id1
@@ -1257,6 +1268,12 @@ def demo():
 
 
 if __name__ == '__main__':
+    r"""
+    CommandLine:
+        python ~/code/VIAME/plugins/camtrawl/python/gmm_online_background_subtraction.py
+    """
     demo()
     # import utool as ut
     # ut.dump_profile_text()
+    # import pytest
+    # pytest.main([__file__, '--doctest-modules'])
