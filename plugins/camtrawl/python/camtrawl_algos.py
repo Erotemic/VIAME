@@ -1096,7 +1096,7 @@ def demo():
     DRAWING = 1
     if bg_algo == 'gmm':
         # Use GMM based model
-        stride = 2
+        stride = 1
         gmm_params = {
             'bg_algo': bg_algo,
             'n_training_frames': 9999,
@@ -1190,6 +1190,12 @@ def demo():
                                                         img2, detections2, masks2,
                                                         assignment, assign_data,
                                                         cand_errors)
+            stacked = cv2.putText(stacked,
+                                  text='frame {}'.format(frame_id),
+                                  org=(10, 50),
+                                  fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                                  fontScale=1, color=(255, 0, 0),
+                                  thickness=2, lineType=cv2.LINE_AA)
             cv2.imwrite(dpath + '/mask{}_draw.png'.format(frame_id), stacked)
 
     all_errors = np.array(all_errors)
@@ -1203,6 +1209,9 @@ if __name__ == '__main__':
     r"""
     CommandLine:
         python ~/code/VIAME/plugins/camtrawl/python/camtrawl_algos.py
+        ffmpeg -start_number 3662 -i out_haul83/mask0%d_draw.png -vcodec mpeg4 -framerate 2 haul83.avi
+
+        ffmpeg -y -f image2 -i out_haul83/%*.png -vcodec mpeg4 -vf "setpts=10*PTS" haul83.avi
     """
     demo()
     # import utool as ut
