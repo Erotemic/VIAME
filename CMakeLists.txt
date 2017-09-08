@@ -109,6 +109,7 @@ if( VIAME_ENABLE_PYTHON )
   if (NOT WIN32)
     option(VIAME_SYMLINK_PYTHON "Symlink python files instead of copying. Allows for more dynamic python development." Off)
   endif()
+  set(KWIVER_SYMLINK_PYTHON ${VIAME_SYMLINK_PYTHON})
 
   find_package( PythonInterp REQUIRED )
   find_package( PythonLibs REQUIRED )
